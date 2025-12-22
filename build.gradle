@@ -1,15 +1,6 @@
 apply plugin: 'com.android.library'
 
-buildscript {
-    repositories {
-        mavenCentral()
-        google()
-    }
-
-    dependencies {
-        classpath 'com.android.tools.build:gradle:8.3.0'
-    }
-}
+// Note: buildscript removed - AGP version managed by root project
 
 repositories {
     google()
