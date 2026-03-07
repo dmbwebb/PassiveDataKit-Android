@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
@@ -17,6 +18,7 @@ import androidx.core.app.NotificationManagerCompat;
 import com.audacious_software.passive_data_kit.R;
 
 public class ForegroundService extends Service {
+    private static final String TAG = "PDK-ForegroundService";
     public static final String ACTION_START_SERVICE = "com.audacious_software.passive_data_kit.ForegroundService.ACTION_START_SERVICE";
 
     public static final int NOTIFICATION_ID = 778642;
@@ -43,10 +45,16 @@ public class ForegroundService extends Service {
             }
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            this.startForeground(ForegroundService.NOTIFICATION_ID, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        } else {
-            this.startForeground(ForegroundService.NOTIFICATION_ID, note);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                this.startForeground(ForegroundService.NOTIFICATION_ID, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                this.startForeground(ForegroundService.NOTIFICATION_ID, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                this.startForeground(ForegroundService.NOTIFICATION_ID, note);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start foreground service: " + e.getMessage(), e);
         }
 
         return Service.START_STICKY;
