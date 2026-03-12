@@ -141,9 +141,13 @@ public class PassiveDataKit {
 
         if (this.mStartForegroundService || this.mAlwaysNotify) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ContextCompat.startForegroundService(this.mContext, intent);
+                try {
+                    ContextCompat.startForegroundService(this.mContext, intent);
 
-                notificationStarted = true;
+                    notificationStarted = true;
+                } catch (Exception e) {
+                    Log.e("PDK", "Cannot start foreground service: " + e.getMessage());
+                }
             }
         }
 

@@ -8,6 +8,7 @@ import android.os.Bundle;
 import com.audacious_software.passive_data_kit.Logger;
 import com.audacious_software.passive_data_kit.generators.services.GoogleFit;
 import com.google.android.gms.auth.api.signin.GoogleSignIn;
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount;
 import com.google.android.gms.fitness.FitnessOptions;
 import com.google.android.gms.fitness.data.DataType;
 
@@ -38,6 +39,11 @@ public class RequestPermissionActivity extends Activity
 
             Bundle extras = this.getIntent().getExtras();
 
+            if (extras == null) {
+                this.finish();
+                return;
+            }
+
             String permission = extras.getString(RequestPermissionActivity.PERMISSION);
 
             if (GoogleFit.GOOGLE_FIT_PERMISSIONS.equals(permission)) {
@@ -51,7 +57,13 @@ public class RequestPermissionActivity extends Activity
 
                 FitnessOptions options = builder.build();
 
-                GoogleSignIn.requestPermissions(this, RequestPermissionActivity.GOOGLE_FIT_PERMISSIONS_REQUEST_CODE, GoogleSignIn.getLastSignedInAccount(this), options);
+                GoogleSignInAccount account = GoogleSignIn.getLastSignedInAccount(this);
+
+                if (account != null) {
+                    GoogleSignIn.requestPermissions(this, RequestPermissionActivity.GOOGLE_FIT_PERMISSIONS_REQUEST_CODE, account, options);
+                } else {
+                    this.finish();
+                }
             } else {
                 ActivityCompat.requestPermissions(this, new String[]{permission}, 0);
             }
@@ -61,6 +73,12 @@ public class RequestPermissionActivity extends Activity
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         Bundle extras = this.getIntent().getExtras();
+
+        if (extras == null) {
+            this.finish();
+            return;
+        }
+
         String permission = extras.getString(RequestPermissionActivity.PERMISSION);
 
         /*
