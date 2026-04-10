@@ -46,7 +46,7 @@ public class UsageStatsGenerator extends Generator {
     private static final String SAMPLE_INTERVAL = "com.audacious_software.passive_data_kit.generators.device.UsageStatsGenerator.SAMPLE_INTERVAL";
     private static final long SAMPLE_INTERVAL_DEFAULT = 300000;
     private static final String ENABLED = "com.audacious_software.passive_data_kit.generators.device.UsageStatsGenerator.ENABLED";
-    private static final boolean ENABLED_DEFAULT = false;
+    private static final boolean ENABLED_DEFAULT = true;
     private static final String DATA_RETENTION_PERIOD = "com.audacious_software.passive_data_kit.generators.device.UsageStatsGenerator.DATA_RETENTION_PERIOD";;
     private static final String TABLE_HISTORY = "history";
     private static final String HISTORY_OBSERVED = "observed";
@@ -149,8 +149,8 @@ public class UsageStatsGenerator extends Generator {
 
                 long start = me.getLatestTimestamp();
 
-                if ((now - start) > (24 * 60 * 60 * 1000)) {
-                    start = now - (24 * 60 * 60 * 1000);
+                if ((now - start) > (7L * 24 * 60 * 60 * 1000)) {
+                    start = now - (7L * 24 * 60 * 60 * 1000);
                 }
 
                 UsageEvents usageEvents = mUsageStatsManager.queryEvents(start + 1, now);
