@@ -24,6 +24,9 @@
     <!-- Battery Generator -->
     <string name="pdk_generator_device_battery_create_history_table" translatable="false">CREATE TABLE history(_id INTEGER PRIMARY KEY AUTOINCREMENT, fetched INTEGER, transmitted INTEGER, observed INTEGER, health TEXT, level INTERGER, plugged TEXT, present INTEGER, scale INTEGER, temperature INTEGER, voltage INTEGER, technology TEXT, status TEXT);</string>
 
+    <!-- Daily Usage Aggregate Generator -->
+    <string name="pdk_generator_daily_usage_aggregate_create_history_table" translatable="false">CREATE TABLE history(_id INTEGER PRIMARY KEY AUTOINCREMENT, fetched INTEGER, transmitted INTEGER, observed INTEGER, day_bucket INTEGER, package TEXT, total_ms INTEGER, first_timestamp INTEGER, last_timestamp INTEGER, last_time_used INTEGER, UNIQUE(day_bucket, package) ON CONFLICT REPLACE);</string>
+
     <!-- Foreground Applications Generator -->
     <string name="pdk_generator_foreground_applications_create_history_table" translatable="false">CREATE TABLE history(_id INTEGER PRIMARY KEY AUTOINCREMENT, fetched INTEGER, transmitted INTEGER, observed INTEGER, application TEXT);</string>
     <string name="pdk_generator_foreground_applications_history_table_add_duration" translatable="false">ALTER TABLE history ADD duration REAL;</string>

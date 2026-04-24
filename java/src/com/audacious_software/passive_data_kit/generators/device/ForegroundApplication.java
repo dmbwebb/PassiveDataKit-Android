@@ -2,6 +2,9 @@ package com.audacious_software.passive_data_kit.generators.device;
 
 import android.annotation.SuppressLint;
 import android.app.AppOpsManager;
+import android.app.Service;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStatsManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
@@ -17,6 +20,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.preference.PreferenceManager;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Display;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -185,7 +189,33 @@ public class ForegroundApplication extends Generator {
 
     @SuppressWarnings("unused")
     public static void start(final Context context) {
-        ForegroundApplication.getInstance(context).startGenerator();
+        SharedPreferences prefs = Generators.getInstance(context).getSharedPreferences(context);
+
+        if (prefs.getBoolean(ForegroundApplication.ENABLED, ForegroundApplication.ENABLED_DEFAULT)) {
+            ForegroundApplication.getInstance(context).startGenerator();
+        }
+    }
+
+    private void setEnabled(boolean enabled) {
+        SharedPreferences prefs = Generators.getInstance(this.mContext).getSharedPreferences(this.mContext);
+        SharedPreferences.Editor e = prefs.edit();
+
+        e.putBoolean(ForegroundApplication.ENABLED, enabled);
+
+        e.apply();
+
+        if (enabled) {
+            this.startGenerator();
+        } else {
+            this.stopGenerator();
+        }
+    }
+
+    private void stopGenerator() {
+        if (this.mAppChecker != null) {
+            this.mAppChecker.stop();
+            this.mAppChecker = null;
+        }
     }
 
     public void setSampleInterval(long interval) {
@@ -389,8 +419,176 @@ public class ForegroundApplication extends Generator {
         return category;
     }
 
+    /**
+     * Backfill foreground app data from Android's UsageStatsManager for any gap
+     * since the last recorded observation. This recovers data lost when the OS
+     * killed our background polling service.
+     *
+     * Generates 15-second sample rows matching the existing format so downstream
+     * analysis code doesn't need changes.
+     */
+    private void backfillFromUsageStats() {
+        try {
+            // Find the last recorded timestamp in our database
+            long lastObserved = 0;
+            Cursor c = this.mDatabase.query(
+                ForegroundApplication.TABLE_HISTORY,
+                new String[]{ "MAX(" + ForegroundApplication.HISTORY_OBSERVED + ")" },
+                null, null, null, null, null
+            );
+            if (c.moveToFirst() && !c.isNull(0)) {
+                lastObserved = c.getLong(0);
+            }
+            c.close();
+
+            if (lastObserved == 0) {
+                return; // No prior data, nothing to backfill from
+            }
+
+            long now = System.currentTimeMillis();
+            SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this.mContext);
+            long sampleInterval = prefs.getLong(ForegroundApplication.SAMPLE_INTERVAL, ForegroundApplication.SAMPLE_INTERVAL_DEFAULT);
+
+            long gap = now - lastObserved;
+
+            // Only backfill if the gap is significant (> 2x sample interval)
+            if (gap <= sampleInterval * 2) {
+                return;
+            }
+
+            // Cap lookback at 24 hours (Android's UsageStatsManager limit)
+            long backfillStart = lastObserved;
+            if (gap > 24 * 60 * 60 * 1000) {
+                backfillStart = now - (24 * 60 * 60 * 1000);
+            }
+
+            UsageStatsManager usageStatsManager = (UsageStatsManager) this.mContext.getSystemService(Service.USAGE_STATS_SERVICE);
+            if (usageStatsManager == null) {
+                return;
+            }
+
+            UsageEvents usageEvents = usageStatsManager.queryEvents(backfillStart + 1, now);
+            if (usageEvents == null) {
+                return;
+            }
+
+            // Build a timeline of foreground app sessions from usage events
+            // Each entry: [timestamp, packageName] when an app came to foreground
+            ArrayList<long[]> sessionTimestamps = new ArrayList<>();
+            ArrayList<String> sessionPackages = new ArrayList<>();
+            UsageEvents.Event event = new UsageEvents.Event();
+
+            while (usageEvents.hasNextEvent()) {
+                usageEvents.getNextEvent(event);
+
+                int eventType = event.getEventType();
+                // ACTIVITY_RESUMED (or MOVE_TO_FOREGROUND on older APIs) indicates app came to foreground
+                if (eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    sessionTimestamps.add(new long[]{ event.getTimeStamp() });
+                    sessionPackages.add(event.getPackageName());
+                }
+            }
+
+            if (sessionTimestamps.isEmpty()) {
+                return;
+            }
+
+            // Resolve home launcher packages once
+            HashSet<String> homeLaunchers = new HashSet<>();
+            Intent startMain = new Intent(Intent.ACTION_MAIN);
+            startMain.addCategory(Intent.CATEGORY_HOME);
+            startMain.addCategory(Intent.CATEGORY_DEFAULT);
+            PackageManager manager = this.mContext.getPackageManager();
+            List<ResolveInfo> startMatches = manager.queryIntentActivities(startMain, 0);
+            for (ResolveInfo info : startMatches) {
+                if (info.activityInfo.packageName != null) {
+                    homeLaunchers.add(info.activityInfo.packageName);
+                }
+            }
+
+            // Generate 15-second sample rows for each foreground session
+            int backfilledRows = 0;
+
+            this.mDatabase.beginTransaction();
+            try {
+                for (int i = 0; i < sessionTimestamps.size(); i++) {
+                    long sessionStart = sessionTimestamps.get(i)[0];
+                    long sessionEnd;
+
+                    if (i + 1 < sessionTimestamps.size()) {
+                        sessionEnd = sessionTimestamps.get(i + 1)[0];
+                    } else {
+                        sessionEnd = now;
+                    }
+
+                    // Skip sessions that are before our gap (already recorded)
+                    if (sessionStart <= lastObserved) {
+                        sessionStart = lastObserved + sampleInterval;
+                    }
+
+                    if (sessionStart >= sessionEnd) {
+                        continue;
+                    }
+
+                    String packageName = sessionPackages.get(i);
+                    String category = this.fetchCategory(packageName);
+                    boolean isHome = homeLaunchers.contains(packageName);
+
+                    // Check app privacy settings
+                    if (this.isAppEnabled(packageName) == false) {
+                        packageName = this.obscureIdentifier(packageName);
+                        category = this.obscureIdentifier(category);
+                    }
+
+                    // Generate sample rows at sampleInterval spacing
+                    for (long t = sessionStart; t < sessionEnd; t += sampleInterval) {
+                        ContentValues values = new ContentValues();
+                        values.put(ForegroundApplication.HISTORY_OBSERVED, t);
+                        values.put(ForegroundApplication.HISTORY_APPLICATION, packageName);
+                        values.put(ForegroundApplication.HISTORY_CATEGORY, category);
+                        values.put(ForegroundApplication.HISTORY_DURATION, sampleInterval);
+                        values.put(ForegroundApplication.HISTORY_SCREEN_ACTIVE, true);
+                        values.put(ForegroundApplication.HISTORY_IS_HOME, isHome);
+                        values.put(ForegroundApplication.HISTORY_DISPLAY_STATE, ForegroundApplication.HISTORY_DISPLAY_STATE_ON);
+
+                        this.mDatabase.insert(ForegroundApplication.TABLE_HISTORY, null, values);
+
+                        // Notify transmitter so backfilled data reaches the server
+                        Bundle update = new Bundle();
+                        update.putLong(ForegroundApplication.HISTORY_OBSERVED, t);
+                        update.putString(ForegroundApplication.HISTORY_APPLICATION, packageName);
+                        update.putString(ForegroundApplication.HISTORY_CATEGORY, category);
+                        update.putLong(ForegroundApplication.HISTORY_DURATION, sampleInterval);
+                        update.putBoolean(ForegroundApplication.HISTORY_SCREEN_ACTIVE, true);
+                        update.putBoolean(ForegroundApplication.HISTORY_IS_HOME, isHome);
+                        update.putString(ForegroundApplication.HISTORY_DISPLAY_STATE, ForegroundApplication.HISTORY_DISPLAY_STATE_ON);
+
+                        Generators.getInstance(this.mContext).notifyGeneratorUpdated(ForegroundApplication.GENERATOR_IDENTIFIER, update);
+
+                        backfilledRows++;
+                    }
+                }
+
+                this.mDatabase.setTransactionSuccessful();
+            } finally {
+                this.mDatabase.endTransaction();
+            }
+
+            if (backfilledRows > 0) {
+                long gapMinutes = gap / (60 * 1000);
+                Log.i("PDK-ForegroundApp", "Backfilled " + backfilledRows + " rows covering " + gapMinutes + " minute gap from UsageStats");
+            }
+
+        } catch (Exception e) {
+            Log.e("PDK-ForegroundApp", "Error during backfill from UsageStats", e);
+        }
+    }
+
     private void startGenerator() {
         final ForegroundApplication me = this;
+
+        // Backfill any gap from when the OS killed our polling service
+        this.backfillFromUsageStats();
 
         if (this.mAppChecker != null) {
             this.mAppChecker.stop();
@@ -761,13 +959,18 @@ public class ForegroundApplication extends Generator {
     public void updateConfig(JSONObject config) {
         SharedPreferences prefs = Generators.getInstance(this.mContext).getSharedPreferences(this.mContext);
         SharedPreferences.Editor e = prefs.edit();
-        e.putBoolean(ForegroundApplication.ENABLED, true);
 
         e.putString(ForegroundApplication.LAST_CONFIGURATION, config.toString());
 
         e.apply();
 
         try {
+            if (config.has("enabled")) {
+                this.setEnabled(config.getBoolean("enabled"));
+
+                config.remove("enabled");
+            }
+
             if (config.has("sample-interval")) {
                 this.setSampleInterval(config.getLong("sample-interval"));
 
