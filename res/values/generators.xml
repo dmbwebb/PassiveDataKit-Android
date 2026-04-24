@@ -307,5 +307,8 @@
     <!-- Usage Stats -->
     <string name="generator_usage_stats_application">Device Usage Events</string>
 
+    <!-- Daily Usage Aggregate -->
+    <string name="generator_daily_usage_aggregate">Daily App Usage Aggregate</string>
+
 </resources>
 

@@ -10,7 +10,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
-import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.os.Build;
 import android.os.Bundle;
@@ -36,13 +35,9 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Daily per-app usage aggregate generator.
- *
- * Uses UsageStatsManager.queryUsageStats(INTERVAL_DAILY) which has ~2-year retention
- * on Samsung (and all AOSP devices), unlike queryEvents which is purged after 7 days.
- *
- * Safety net for when Samsung Device Care / OPPO App Freeze puts the app into Deep Sleep
- * and our other polling generators miss data.
+ * Per-(day, package) totalTimeInForeground aggregate from
+ * {@link UsageStatsManager#queryUsageStats(int, long, long)} with
+ * INTERVAL_DAILY.
  */
 public class DailyUsageAggregateGenerator extends Generator {
     private static final String GENERATOR_IDENTIFIER = "pdk-daily-usage-aggregate";
@@ -148,7 +143,6 @@ public class DailyUsageAggregateGenerator extends Generator {
             }
         };
 
-        // Run shortly after start, then every sampleInterval ms
         this.mService.schedule(runnable, 10000, TimeUnit.MILLISECONDS);
     }
 
@@ -162,12 +156,6 @@ public class DailyUsageAggregateGenerator extends Generator {
         this.mService = null;
     }
 
-    /**
-     * Query queryUsageStats(INTERVAL_DAILY) for the last N days and insert
-     * one row per (day_bucket, package) with totalTimeInForeground.
-     *
-     * Visible to tests.
-     */
     void runAggregation() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
             return;
@@ -188,16 +176,7 @@ public class DailyUsageAggregateGenerator extends Generator {
 
         long now = System.currentTimeMillis();
 
-        // Walk day-by-day at local-midnight boundaries.
-        // day_bucket = epoch ms at local midnight at start of day.
-        Calendar cal = Calendar.getInstance();
-        cal.setTimeInMillis(now);
-        cal.set(Calendar.HOUR_OF_DAY, 0);
-        cal.set(Calendar.MINUTE, 0);
-        cal.set(Calendar.SECOND, 0);
-        cal.set(Calendar.MILLISECOND, 0);
-
-        long todayBucket = cal.getTimeInMillis();
+        long todayBucket = computeDayBucket(now, TimeZone.getDefault());
 
         for (int i = 0; i < lookbackDays; i++) {
             long dayStart = todayBucket - (long) i * 24L * 60L * 60L * 1000L;
@@ -235,9 +214,6 @@ public class DailyUsageAggregateGenerator extends Generator {
                 long lastTs = us.getLastTimeStamp();
                 long lastTimeUsed = us.getLastTimeUsed();
 
-                // Dedup: if a row already exists for this (day_bucket, package) with the
-                // SAME total_ms, skip inserting/notifying. Otherwise the ON CONFLICT REPLACE
-                // will update the row.
                 if (rowUnchanged(dayStart, packageName, totalMs)) {
                     continue;
                 }
@@ -338,7 +314,7 @@ public class DailyUsageAggregateGenerator extends Generator {
     }
 
     public static String getGeneratorTitle(Context context) {
-        return context.getString(R.string.generator_usage_stats_application);
+        return context.getString(R.string.generator_daily_usage_aggregate);
     }
 
     protected void flushCachedData() {
@@ -382,15 +358,7 @@ public class DailyUsageAggregateGenerator extends Generator {
     }
 
     public Cursor queryHistory(String[] cols, String where, String[] args, String orderBy) {
-        if (this.mDatabase != null) {
-            return this.mDatabase.query(DailyUsageAggregateGenerator.TABLE_HISTORY, cols, where, args, null, null, orderBy);
-        }
-
-        if (cols == null) {
-            cols = new String[0];
-        }
-
-        return new MatrixCursor(cols);
+        return this.mDatabase.query(DailyUsageAggregateGenerator.TABLE_HISTORY, cols, where, args, null, null, orderBy);
     }
 
     public void updateConfig(JSONObject config) {
