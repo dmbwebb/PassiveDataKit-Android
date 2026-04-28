@@ -1,10 +1,13 @@
 package com.audacious_software.passive_data_kit.generators.device;
 
 import android.annotation.SuppressLint;
+import android.app.AlarmManager;
 import android.app.AppOpsManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
+import android.content.BroadcastReceiver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
@@ -29,10 +32,9 @@ import org.json.JSONObject;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Date;
 import java.util.List;
 import java.util.TimeZone;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Per-(day, package) totalTimeInForeground aggregate from
@@ -53,6 +55,30 @@ public class DailyUsageAggregateGenerator extends Generator {
     private static final String SAMPLE_INTERVAL = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.SAMPLE_INTERVAL";
     private static final long SAMPLE_INTERVAL_DEFAULT = 24L * 60L * 60L * 1000L; // once per day
 
+    /**
+     * Intent action for the AlarmManager fire that triggers a backfill run.
+     * Routed to {@link AlarmReceiver}.
+     */
+    public static final String ACTION_RUN_AGGREGATION =
+            "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.RUN_AGGREGATION";
+
+    /**
+     * Hour-of-day (device-local) at which the daily alarm fires. 15:00 (3pm)
+     * is mid-afternoon, when phones are nearly always powered on, on a network,
+     * and not in an OEM "deep sleep" / Adaptive Battery / overnight Battery
+     * Saver state — maximizing the probability that the alarm fires on its
+     * intended day. The previous day's INTERVAL_DAILY bucket has been
+     * finalized for ~15 hours by then, well within the OS write window.
+     */
+    private static final int ALARM_HOUR_LOCAL = 15;
+
+    /**
+     * Stable PendingIntent request code for the daily alarm. Anything unique
+     * within the host app works; the value just has to be deterministic so
+     * re-creating the PendingIntent matches the previously scheduled one.
+     */
+    private static final int ALARM_REQUEST_CODE = 0xDA15;
+
     private static final String DATA_RETENTION_PERIOD = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.DATA_RETENTION_PERIOD";
     private static final long DATA_RETENTION_PERIOD_DEFAULT = (365L * 24L * 60L * 60L * 1000L);
 
@@ -69,7 +95,6 @@ public class DailyUsageAggregateGenerator extends Generator {
 
     private static DailyUsageAggregateGenerator sInstance;
     private final SQLiteDatabase mDatabase;
-    private ScheduledThreadPoolExecutor mService;
 
     @Override
     public String getIdentifier() {
@@ -111,52 +136,98 @@ public class DailyUsageAggregateGenerator extends Generator {
     public static void start(final Context context) {
         SharedPreferences prefs = Generators.getInstance(context).getSharedPreferences(context);
 
+        // Touch the singleton so the SQLite database opens and the
+        // AlarmReceiver inner class has somewhere to write rows when it fires.
+        DailyUsageAggregateGenerator.getInstance(context);
+
         if (prefs.getBoolean(DailyUsageAggregateGenerator.ENABLED, DailyUsageAggregateGenerator.ENABLED_DEFAULT)) {
-            DailyUsageAggregateGenerator.getInstance(context).startGenerator();
+            DailyUsageAggregateGenerator.scheduleNextAlarm(context);
+        } else {
+            DailyUsageAggregateGenerator.cancelAlarm(context);
         }
     }
 
-    private void startGenerator() {
-        if (this.mService != null) {
+    /**
+     * Schedule (or re-schedule) the next daily-aggregate alarm for the next
+     * {@link #ALARM_HOUR_LOCAL} hour in the device's local timezone, using
+     * {@link AlarmManager#setAndAllowWhileIdle}. Idempotent: re-arming
+     * overwrites any previously scheduled fire for the same PendingIntent.
+     *
+     * Inexact (±15 min in Doze) is intentional — the daily backfill tolerates
+     * that slack and inexact alarms require no special permission, no Play
+     * Console policy declaration, and aren't subject to the user-revocable
+     * SCHEDULE_EXACT_ALARM grant.
+     */
+    public static void scheduleNextAlarm(Context context) {
+        Context appCtx = context.getApplicationContext();
+        AlarmManager am = (AlarmManager) appCtx.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) {
             return;
         }
 
-        final DailyUsageAggregateGenerator me = this;
+        long now = System.currentTimeMillis();
+        long nextFire = computeNextFireTime(now, TimeZone.getDefault());
 
-        this.mService = new ScheduledThreadPoolExecutor(1);
+        PendingIntent pi = createAlarmPendingIntent(appCtx, false);
 
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this.mContext);
-        final long sampleInterval = prefs.getLong(DailyUsageAggregateGenerator.SAMPLE_INTERVAL, DailyUsageAggregateGenerator.SAMPLE_INTERVAL_DEFAULT);
-
-        Runnable runnable = new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    me.runAggregation();
-                } catch (Throwable t) {
-                    Log.e("PDK", "DailyUsageAggregate failure", t);
-                }
-
-                if (me.mService != null && !me.mService.isShutdown()) {
-                    me.mService.schedule(this, sampleInterval, TimeUnit.MILLISECONDS);
-                }
-            }
-        };
-
-        this.mService.schedule(runnable, 10000, TimeUnit.MILLISECONDS);
+        try {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextFire, pi);
+            Log.i("PDK", "DailyUsageAggregate alarm scheduled for " + new Date(nextFire));
+        } catch (Throwable t) {
+            Log.e("PDK", "DailyUsageAggregate alarm schedule failed", t);
+        }
     }
 
-    private void stopGenerator() {
-        if (this.mService == null) {
+    /**
+     * Cancel any pending daily-aggregate alarm.
+     */
+    public static void cancelAlarm(Context context) {
+        Context appCtx = context.getApplicationContext();
+        AlarmManager am = (AlarmManager) appCtx.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) {
             return;
         }
 
-        this.mService.shutdown();
-
-        this.mService = null;
+        PendingIntent existing = createAlarmPendingIntent(appCtx, true);
+        if (existing != null) {
+            am.cancel(existing);
+            existing.cancel();
+        }
     }
 
-    void runAggregation() {
+    /**
+     * Build the canonical PendingIntent used for the daily alarm. Always
+     * targets {@link AlarmReceiver} explicitly with {@link #ACTION_RUN_AGGREGATION}.
+     *
+     * @param noCreate when true, returns null if no PendingIntent is currently
+     *                 registered (used for existence checks); when false,
+     *                 always returns a non-null PendingIntent (FLAG_UPDATE_CURRENT).
+     */
+    private static PendingIntent createAlarmPendingIntent(Context ctx, boolean noCreate) {
+        Intent i = new Intent(ctx, AlarmReceiver.class).setAction(ACTION_RUN_AGGREGATION);
+        int flags = PendingIntent.FLAG_IMMUTABLE
+                | (noCreate ? PendingIntent.FLAG_NO_CREATE : PendingIntent.FLAG_UPDATE_CURRENT);
+        return PendingIntent.getBroadcast(ctx, ALARM_REQUEST_CODE, i, flags);
+    }
+
+    /**
+     * Compute the next strictly-future {@link #ALARM_HOUR_LOCAL}:00 timestamp
+     * in the given timezone, in epoch millis.
+     */
+    static long computeNextFireTime(long now, TimeZone tz) {
+        Calendar cal = Calendar.getInstance(tz);
+        cal.setTimeInMillis(now);
+        cal.set(Calendar.HOUR_OF_DAY, ALARM_HOUR_LOCAL);
+        cal.set(Calendar.MINUTE, 0);
+        cal.set(Calendar.SECOND, 0);
+        cal.set(Calendar.MILLISECOND, 0);
+        if (cal.getTimeInMillis() <= now) {
+            cal.add(Calendar.DAY_OF_MONTH, 1);
+        }
+        return cal.getTimeInMillis();
+    }
+
+    public void runAggregation() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
             return;
         }
@@ -269,11 +340,9 @@ public class DailyUsageAggregateGenerator extends Generator {
 
     @SuppressWarnings({"unused"})
     public static boolean isRunning(Context context) {
-        if (DailyUsageAggregateGenerator.sInstance == null) {
-            return false;
-        }
-
-        return DailyUsageAggregateGenerator.sInstance.mService != null;
+        // "Running" now means a daily AlarmManager fire is pending for the
+        // canonical PendingIntent.
+        return createAlarmPendingIntent(context.getApplicationContext(), true) != null;
     }
 
     @SuppressLint("InlinedApi")
@@ -401,9 +470,9 @@ public class DailyUsageAggregateGenerator extends Generator {
         e.apply();
 
         if (enabled) {
-            this.startGenerator();
+            DailyUsageAggregateGenerator.scheduleNextAlarm(this.mContext);
         } else {
-            this.stopGenerator();
+            DailyUsageAggregateGenerator.cancelAlarm(this.mContext);
         }
     }
 
@@ -433,5 +502,52 @@ public class DailyUsageAggregateGenerator extends Generator {
         cal.set(Calendar.SECOND, 0);
         cal.set(Calendar.MILLISECOND, 0);
         return cal.getTimeInMillis();
+    }
+
+    /**
+     * Manifest-declared receiver for the daily AlarmManager fire and for
+     * BOOT_COMPLETED / MY_PACKAGE_REPLACED re-arming. The alarm fire path
+     * runs the SQLite/UsageStats aggregation via {@link #goAsync()} on a
+     * worker thread (well under the 10-second receiver budget) and re-arms
+     * the next fire. Boot/replace just re-arms without running aggregation
+     * since UsageStats may not be ready immediately post-boot.
+     */
+    public static class AlarmReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(final Context context, Intent intent) {
+            final String action = (intent != null) ? intent.getAction() : null;
+
+            if (Intent.ACTION_BOOT_COMPLETED.equals(action)
+                    || "android.intent.action.LOCKED_BOOT_COMPLETED".equals(action)
+                    || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
+                DailyUsageAggregateGenerator.scheduleNextAlarm(context);
+                return;
+            }
+
+            if (!ACTION_RUN_AGGREGATION.equals(action)) {
+                return;
+            }
+
+            final PendingResult result = goAsync();
+            final Context appCtx = context.getApplicationContext();
+
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        DailyUsageAggregateGenerator.getInstance(appCtx).runAggregation();
+                    } catch (Throwable t) {
+                        Log.e("PDK", "DailyUsageAggregate failure (alarm fire)", t);
+                    } finally {
+                        try {
+                            DailyUsageAggregateGenerator.scheduleNextAlarm(appCtx);
+                        } catch (Throwable t) {
+                            Log.e("PDK", "DailyUsageAggregate reschedule failed", t);
+                        }
+                        result.finish();
+                    }
+                }
+            }, "PDK-DailyUsageAggregate").start();
+        }
     }
 }
