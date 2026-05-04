@@ -35,6 +35,9 @@ import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
 import java.util.TimeZone;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Per-(day, package) totalTimeInForeground aggregate from
@@ -54,6 +57,10 @@ public class DailyUsageAggregateGenerator extends Generator {
 
     private static final String SAMPLE_INTERVAL = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.SAMPLE_INTERVAL";
     private static final long SAMPLE_INTERVAL_DEFAULT = 24L * 60L * 60L * 1000L; // once per day
+
+    private static final String LAST_OPPORTUNISTIC_RUN = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.LAST_OPPORTUNISTIC_RUN";
+    private static final long OPPORTUNISTIC_STARTUP_DELAY = 10L * 1000L;
+    private static final long OPPORTUNISTIC_COOLDOWN = 6L * 60L * 60L * 1000L;
 
     /**
      * Intent action for the AlarmManager fire that triggers a backfill run.
@@ -94,6 +101,8 @@ public class DailyUsageAggregateGenerator extends Generator {
     private static final String HISTORY_LAST_TIME_USED = "last_time_used";
 
     private static DailyUsageAggregateGenerator sInstance;
+    private static final AtomicBoolean sAggregationRunning = new AtomicBoolean(false);
+    private static final AtomicBoolean sOpportunisticRunScheduled = new AtomicBoolean(false);
     private final SQLiteDatabase mDatabase;
 
     @Override
@@ -142,9 +151,44 @@ public class DailyUsageAggregateGenerator extends Generator {
 
         if (prefs.getBoolean(DailyUsageAggregateGenerator.ENABLED, DailyUsageAggregateGenerator.ENABLED_DEFAULT)) {
             DailyUsageAggregateGenerator.scheduleNextAlarm(context);
+            DailyUsageAggregateGenerator.scheduleOpportunisticAggregation(context);
         } else {
             DailyUsageAggregateGenerator.cancelAlarm(context);
         }
+    }
+
+    private static void scheduleOpportunisticAggregation(final Context context) {
+        final Context appCtx = context.getApplicationContext();
+        final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(appCtx);
+        long now = System.currentTimeMillis();
+        long lastRun = prefs.getLong(DailyUsageAggregateGenerator.LAST_OPPORTUNISTIC_RUN, 0L);
+
+        if (now - lastRun < DailyUsageAggregateGenerator.OPPORTUNISTIC_COOLDOWN) {
+            return;
+        }
+
+        if (DailyUsageAggregateGenerator.sOpportunisticRunScheduled.compareAndSet(false, true) == false) {
+            return;
+        }
+
+        final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1);
+        executor.setRemoveOnCancelPolicy(true);
+        executor.schedule(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    prefs.edit()
+                            .putLong(DailyUsageAggregateGenerator.LAST_OPPORTUNISTIC_RUN, System.currentTimeMillis())
+                            .apply();
+                    DailyUsageAggregateGenerator.getInstance(appCtx).runAggregation();
+                } catch (Throwable t) {
+                    Log.e("PDK", "DailyUsageAggregate failure (opportunistic startup)", t);
+                } finally {
+                    DailyUsageAggregateGenerator.sOpportunisticRunScheduled.set(false);
+                    executor.shutdown();
+                }
+            }
+        }, DailyUsageAggregateGenerator.OPPORTUNISTIC_STARTUP_DELAY, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -228,6 +272,19 @@ public class DailyUsageAggregateGenerator extends Generator {
     }
 
     public void runAggregation() {
+        if (DailyUsageAggregateGenerator.sAggregationRunning.compareAndSet(false, true) == false) {
+            Log.i("PDK", "DailyUsageAggregate run already in progress; skipping");
+            return;
+        }
+
+        try {
+            this.runAggregationLocked();
+        } finally {
+            DailyUsageAggregateGenerator.sAggregationRunning.set(false);
+        }
+    }
+
+    private void runAggregationLocked() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
             return;
         }
@@ -471,6 +528,7 @@ public class DailyUsageAggregateGenerator extends Generator {
 
         if (enabled) {
             DailyUsageAggregateGenerator.scheduleNextAlarm(this.mContext);
+            DailyUsageAggregateGenerator.scheduleOpportunisticAggregation(this.mContext);
         } else {
             DailyUsageAggregateGenerator.cancelAlarm(this.mContext);
         }
