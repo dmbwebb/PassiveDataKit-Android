@@ -54,9 +54,10 @@ public class DailyUsageAggregateGenerator extends Generator {
 
     private static final String LOOKBACK_DAYS = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.LOOKBACK_DAYS";
     private static final int LOOKBACK_DAYS_DEFAULT = 30;
+    private static final long DAY_MS = 24L * 60L * 60L * 1000L;
 
     private static final String SAMPLE_INTERVAL = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.SAMPLE_INTERVAL";
-    private static final long SAMPLE_INTERVAL_DEFAULT = 24L * 60L * 60L * 1000L; // once per day
+    private static final long SAMPLE_INTERVAL_DEFAULT = DAY_MS; // once per day
 
     private static final String LAST_OPPORTUNISTIC_RUN = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.LAST_OPPORTUNISTIC_RUN";
     private static final long OPPORTUNISTIC_STARTUP_DELAY = 10L * 1000L;
@@ -87,7 +88,7 @@ public class DailyUsageAggregateGenerator extends Generator {
     private static final int ALARM_REQUEST_CODE = 0xDA15;
 
     private static final String DATA_RETENTION_PERIOD = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.DATA_RETENTION_PERIOD";
-    private static final long DATA_RETENTION_PERIOD_DEFAULT = (365L * 24L * 60L * 60L * 1000L);
+    private static final long DATA_RETENTION_PERIOD_DEFAULT = 365L * DAY_MS;
 
     private static final String LAST_CONFIGURATION = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.LAST_CONFIGURATION";
 
@@ -167,7 +168,7 @@ public class DailyUsageAggregateGenerator extends Generator {
             return;
         }
 
-        if (DailyUsageAggregateGenerator.sOpportunisticRunScheduled.compareAndSet(false, true) == false) {
+        if (!DailyUsageAggregateGenerator.sOpportunisticRunScheduled.compareAndSet(false, true)) {
             return;
         }
 
@@ -272,7 +273,7 @@ public class DailyUsageAggregateGenerator extends Generator {
     }
 
     public void runAggregation() {
-        if (DailyUsageAggregateGenerator.sAggregationRunning.compareAndSet(false, true) == false) {
+        if (!DailyUsageAggregateGenerator.sAggregationRunning.compareAndSet(false, true)) {
             Log.i("PDK", "DailyUsageAggregate run already in progress; skipping");
             return;
         }
@@ -307,8 +308,8 @@ public class DailyUsageAggregateGenerator extends Generator {
         long todayBucket = computeDayBucket(now, TimeZone.getDefault());
 
         for (int i = 0; i < lookbackDays; i++) {
-            long dayStart = todayBucket - (long) i * 24L * 60L * 60L * 1000L;
-            long dayEnd = dayStart + 24L * 60L * 60L * 1000L;
+            long dayStart = todayBucket - (long) i * DAY_MS;
+            long dayEnd = dayStart + DAY_MS;
 
             // For today, query up to "now" so we see in-progress usage.
             long queryEnd = (i == 0) ? now : dayEnd;
