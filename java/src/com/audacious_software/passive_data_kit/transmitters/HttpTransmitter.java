@@ -736,7 +736,9 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
             this.mCurrentFile = null;
             this.mJsonGenerator = null;
 
-            FileUtils.moveFile(tempFile, new File(finalFile));
+            if (tempFile.exists()) {
+                FileUtils.moveFile(tempFile, new File(finalFile));
+            }
 
             String[] filenames = pendingFolder.list(new FilenameFilter() {
                 public boolean accept(File dir, String filename) {
