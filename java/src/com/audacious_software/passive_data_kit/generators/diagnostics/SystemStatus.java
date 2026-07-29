@@ -25,7 +25,6 @@ import android.os.PowerManager;
 import android.os.StatFs;
 import android.os.SystemClock;
 import android.preference.PreferenceManager;
-import android.provider.Settings;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -347,12 +346,12 @@ public class SystemStatus extends Generator {
                 t.start();
 
                 AlarmManager alarms = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
-                PendingIntent pi = PendingIntent.getBroadcast(context, 0, new Intent(SystemStatus.ACTION_HEARTBEAT), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE | PendingIntent.FLAG_ALLOW_UNSAFE_IMPLICIT_INTENT);
+                Intent heartbeat = new Intent(SystemStatus.ACTION_HEARTBEAT);
+                heartbeat.setPackage(context.getPackageName());
+                PendingIntent pi = PendingIntent.getBroadcast(context, 0, heartbeat, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, now + me.mRefreshInterval, pi);
-                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                    alarms.setExact(AlarmManager.RTC_WAKEUP, now + me.mRefreshInterval, pi);
+                    alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, now + me.mRefreshInterval, pi);
                 } else {
                     alarms.set(AlarmManager.RTC_WAKEUP, now + me.mRefreshInterval, pi);
                 }
@@ -395,22 +394,7 @@ public class SystemStatus extends Generator {
 
     @SuppressWarnings({"unused"})
     public static ArrayList<DiagnosticAction> diagnostics(Context context) {
-        ArrayList<DiagnosticAction> actions = new ArrayList<>();
-
-        AlarmManager alarms = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
-
-        if (alarms.canScheduleExactAlarms() == false) {
-            actions.add(new DiagnosticAction(context.getString(R.string.diagnostic_alarm_permission_required_title), context.getString(R.string.diagnostic_alarm_permission_required), new Runnable() {
-                @Override
-                public void run() {
-                    Intent fetchPermission = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM);
-
-                    context.startActivity(fetchPermission);
-                }
-            }));
-        }
-
-        return actions;
+        return new ArrayList<>();
     }
 
     @SuppressWarnings("WeakerAccess")

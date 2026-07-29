@@ -2,8 +2,10 @@ package com.audacious_software.passive_data_kit;
 
 import android.util.Base64;
 
-import org.libsodium.jni.NaCl;
-import org.libsodium.jni.Sodium;
+import com.goterl.lazysodium.LazySodiumAndroid;
+import com.goterl.lazysodium.SodiumAndroid;
+import com.goterl.lazysodium.interfaces.Box;
+import com.goterl.lazysodium.interfaces.Hash;
 
 import java.nio.charset.Charset;
 import java.text.Normalizer;
@@ -11,6 +13,8 @@ import java.util.Locale;
 import java.util.regex.Pattern;
 
 public class Toolbox {
+    private static final LazySodiumAndroid SODIUM = new LazySodiumAndroid(new SodiumAndroid());
+
     private static final Pattern NONLATIN = Pattern.compile("[^\\w-]");
     private static final Pattern WHITESPACE = Pattern.compile("[\\s]");
     private static final Pattern EDGESDHASHES = Pattern.compile("(^-|-$)");
@@ -34,15 +38,11 @@ public class Toolbox {
     }
 
     public static String encrypt(byte[] privateKey, byte[] publicKey, byte[] nonce, String payload) {
-        NaCl.sodium();
-
         byte[] message = payload.getBytes(Charset.forName("UTF-8"));
 
-        long ciphertextLength = Sodium.crypto_box_macbytes() + message.length;
+        byte[] ciphertext = new byte[Box.MACBYTES + message.length];
 
-        byte[] ciphertext = new byte[(int) ciphertextLength];
-
-        if (Sodium.crypto_box_easy(ciphertext, message, message.length, nonce, publicKey, privateKey) == 0) {
+        if (Toolbox.SODIUM.cryptoBoxEasy(ciphertext, message, message.length, nonce, publicKey, privateKey)) {
             return Toolbox.encodeBase64(ciphertext);
         }
 
@@ -50,28 +50,14 @@ public class Toolbox {
     }
 
     public static String hash(String payload) {
-        NaCl.sodium();
-
         byte[] message = payload.getBytes(Charset.forName("UTF-8"));
-
-        long hashLength = Sodium.crypto_hash_sha512_bytes();
-
-        byte[] hashText = new byte[(int) hashLength];
-
-        Sodium.crypto_hash_sha512(hashText, message, message.length);
+        byte[] hashText = new byte[Hash.SHA512_BYTES];
+        Toolbox.SODIUM.cryptoHashSha512(hashText, message, message.length);
 
         return Toolbox.encodeBase64(hashText);
     }
 
     public static byte[] randomNonce() {
-        NaCl.sodium();
-
-        long nonceLength = Sodium.crypto_box_noncebytes();
-
-        byte[] nonce = new byte[(int) nonceLength];
-
-        Sodium.randombytes_buf(nonce,(int) nonceLength);
-
-        return nonce;
+        return Toolbox.SODIUM.randomBytesBuf(Box.NONCEBYTES);
     }
 }
