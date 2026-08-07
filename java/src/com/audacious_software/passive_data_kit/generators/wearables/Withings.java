@@ -27,6 +27,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.audacious_software.passive_data_kit.PassiveDataKit;
+import com.audacious_software.passive_data_kit.PackageManagerUtils;
 import com.audacious_software.passive_data_kit.activities.generators.DataPointViewHolder;
 import com.audacious_software.passive_data_kit.activities.generators.GeneratorViewHolder;
 import com.audacious_software.passive_data_kit.diagnostics.DiagnosticAction;
@@ -1369,7 +1370,9 @@ public class Withings extends Generator {
         }
 
         if (me.mLocalInstallRequired) {
-            Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage("com.withings.wiscale2");
+            Intent launchIntent = PackageManagerUtils.safeGetLaunchIntentForPackage(
+                    context.getPackageManager(),
+                    "com.withings.wiscale2");
 
             if (launchIntent == null) {
                 actions.add(new DiagnosticAction(context.getString(R.string.diagnostic_withings_local_install_required_title), context.getString(R.string.diagnostic_withings_local_install_required), new Runnable() {

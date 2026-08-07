@@ -29,6 +29,7 @@ import android.widget.TextView;
 
 
 import com.audacious_software.passive_data_kit.R;
+import com.audacious_software.passive_data_kit.PackageManagerUtils;
 import com.audacious_software.passive_data_kit.activities.generators.DataPointsAdapter;
 
 import java.util.ArrayList;
@@ -45,15 +46,22 @@ public class AppUsageSelectionActivity extends AppCompatActivity {
         final AppUsageSelectionActivity me = this;
 
         this.setContentView(R.layout.layout_app_usage_selection);
-        this.getSupportActionBar().setTitle(R.string.title_app_usage_selection);
-        this.getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+
+        if (this.getSupportActionBar() != null) {
+            this.getSupportActionBar().setTitle(R.string.title_app_usage_selection);
+            this.getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+        }
 
         final PackageManager packageManager = this.getPackageManager();
 
         List<PackageInfo> apps = new ArrayList<>();
 
         for (PackageInfo pkgInfo : packageManager.getInstalledPackages(PackageManager.GET_META_DATA)) {
-            Intent intent = this.getPackageManager().getLaunchIntentForPackage(pkgInfo.packageName);
+            if (pkgInfo == null || pkgInfo.packageName == null || pkgInfo.applicationInfo == null) {
+                continue;
+            }
+
+            Intent intent = PackageManagerUtils.safeGetLaunchIntentForPackage(packageManager, pkgInfo.packageName);
 
             if (intent != null) {
                 apps.add(pkgInfo);

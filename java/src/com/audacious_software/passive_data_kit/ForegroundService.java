@@ -70,7 +70,9 @@ public class ForegroundService extends Service {
 
     public static Notification getForegroundNotification(Context context, Intent intent, int iconResource) {
         if (intent == null) {
-            intent = context.getPackageManager().getLaunchIntentForPackage(context.getApplicationContext().getPackageName());
+            intent = PackageManagerUtils.safeGetLaunchIntentForPackage(
+                    context.getPackageManager(),
+                    context.getApplicationContext().getPackageName());
         }
 
         PassiveDataKit.getInstance(context).annotateForegroundIntent(intent);
@@ -83,16 +85,24 @@ public class ForegroundService extends Service {
         builder.setPriority(NotificationCompat.PRIORITY_MIN);
         builder.setSound(null);
 
-        builder.setSmallIcon(intent.getIntExtra(PassiveDataKit.NOTIFICATION_ICON_ID, iconResource));
+        int notificationIcon = iconResource;
 
-        if (intent.hasExtra(PassiveDataKit.NOTIFICATION_COLOR)) {
+        if (intent != null) {
+            notificationIcon = intent.getIntExtra(PassiveDataKit.NOTIFICATION_ICON_ID, iconResource);
+        }
+
+        builder.setSmallIcon(notificationIcon);
+
+        if (intent != null && intent.hasExtra(PassiveDataKit.NOTIFICATION_COLOR)) {
             builder.setColor(intent.getIntExtra(PassiveDataKit.NOTIFICATION_COLOR, 0));
         }
 
         PendingIntent pendingIntent = PassiveDataKit.getInstance(context).getForegroundPendingIntent();
 
         if (pendingIntent == null) {
-            Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage(context.getApplicationContext().getPackageName());
+            Intent launchIntent = PackageManagerUtils.safeGetLaunchIntentForPackage(
+                    context.getPackageManager(),
+                    context.getApplicationContext().getPackageName());
 
             PassiveDataKit.getInstance(context).annotateForegroundIntent(launchIntent);
 
