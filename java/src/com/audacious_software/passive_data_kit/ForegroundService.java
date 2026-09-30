@@ -28,8 +28,6 @@ public class ForegroundService extends Service {
     }
 
     public int onStartCommand(Intent intent, int flags, int startId) {
-        super.onCreate();
-
         Notification note = ForegroundService.getForegroundNotification(this, intent);
 
         NotificationManagerCompat noteManager = NotificationManagerCompat.from(this);
@@ -57,6 +55,9 @@ public class ForegroundService extends Service {
             Log.e(TAG, "Failed to start foreground service: " + e.getMessage(), e);
         }
 
+        if (this.getApplication() instanceof PassiveDataKitApplication) {
+            ((PassiveDataKitApplication) this.getApplication()).resumeMonitoring();
+        }
         return Service.START_STICKY;
     }
 

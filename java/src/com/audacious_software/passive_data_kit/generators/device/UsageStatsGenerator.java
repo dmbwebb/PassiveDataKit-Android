@@ -83,6 +83,10 @@ public class UsageStatsGenerator extends Generator {
 
     private final HashMap<String, String> mIdentifierCache = new HashMap<>();
     private ScheduledThreadPoolExecutor mService;
+    private Runnable mCollectionTask;
+    public static final String LAST_QUERY_ATTEMPT = "usage_events_last_query_attempt";
+    public static final String LAST_QUERY_SUCCESS = "usage_events_last_query_success";
+    public static final String LAST_QUERY_RESULT = "usage_events_last_query_result";
 
     @Override
     public String getIdentifier() {
@@ -129,7 +133,7 @@ public class UsageStatsGenerator extends Generator {
         }
     }
 
-    private void startGenerator() {
+    private synchronized void startGenerator() {
         if (this.mService != null) {
             return;
         }
@@ -144,7 +148,18 @@ public class UsageStatsGenerator extends Generator {
         Runnable runnable = new Runnable() {
             @Override
             public void run() {
+                SharedPreferences health = PreferenceManager.getDefaultSharedPreferences(me.mContext);
+                health.edit().putLong(LAST_QUERY_ATTEMPT, System.currentTimeMillis()).apply();
+                try {
+                if (!hasPermissions(me.mContext)) {
+                    health.edit().putString(LAST_QUERY_RESULT, "permission_missing").apply();
+                    return;
+                }
                 UsageStatsManager mUsageStatsManager = (UsageStatsManager) me.mContext.getSystemService(Service.USAGE_STATS_SERVICE);
+                if (mUsageStatsManager == null) {
+                    health.edit().putString(LAST_QUERY_RESULT, "service_unavailable").apply();
+                    return;
+                }
                 long now = System.currentTimeMillis();
 
                 long start = me.getLatestTimestamp();
@@ -154,6 +169,11 @@ public class UsageStatsGenerator extends Generator {
                 }
 
                 UsageEvents usageEvents = mUsageStatsManager.queryEvents(start + 1, now);
+                // Android 11+ can return null until the first unlock after reboot.
+                if (usageEvents == null) {
+                    health.edit().putString(LAST_QUERY_RESULT, "query_unavailable").apply();
+                    return;
+                }
                 UsageEvents.Event event = new UsageEvents.Event();
 
                 while (usageEvents.hasNextEvent()) {
@@ -235,14 +255,18 @@ public class UsageStatsGenerator extends Generator {
                     }
                 }
 
-                me.mService.schedule(this, sampleInterval, TimeUnit.MILLISECONDS);
+                health.edit().putLong(LAST_QUERY_SUCCESS, now).putString(LAST_QUERY_RESULT, "success").apply();
+                } catch (RuntimeException error) {
+                    health.edit().putString(LAST_QUERY_RESULT, "error:" + error.getClass().getSimpleName()).apply();
+                    Log.e("PDK-UsageStats", "Usage query failed; next scheduled query will retry", error);
+                }
             }
         };
-
-        me.mService.schedule(runnable, 5000, TimeUnit.MILLISECONDS);
+        this.mCollectionTask = runnable;
+        me.mService.scheduleWithFixedDelay(runnable, 5000, Math.max(1000, sampleInterval), TimeUnit.MILLISECONDS);
     }
 
-    private void stopGenerator() {
+    private synchronized void stopGenerator() {
         if (this.mService == null) {
             return;
         }
@@ -298,6 +322,7 @@ public class UsageStatsGenerator extends Generator {
     public static boolean hasPermissions(final Context context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+            if (appOps == null) return false;
             int mode = appOps.checkOpNoThrow("android:get_usage_stats", android.os.Process.myUid(), context.getPackageName());
 
             if (mode != AppOpsManager.MODE_ALLOWED) {

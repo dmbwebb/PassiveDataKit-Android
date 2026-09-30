@@ -16,6 +16,7 @@ import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.UserManager;
 import android.preference.PreferenceManager;
 import android.provider.Settings;
 import android.util.Log;
@@ -46,7 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class DailyUsageAggregateGenerator extends Generator {
     private static final String GENERATOR_IDENTIFIER = "pdk-daily-usage-aggregate";
-    private static final int DATABASE_VERSION = 1;
+    private static final int DATABASE_VERSION = 2;
     private static final String DATABASE_PATH = "pdk-daily-usage-aggregate.sqlite";
 
     private static final String ENABLED = "com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator.ENABLED";
@@ -100,6 +101,10 @@ public class DailyUsageAggregateGenerator extends Generator {
     private static final String HISTORY_FIRST_TIMESTAMP = "first_timestamp";
     private static final String HISTORY_LAST_TIMESTAMP = "last_timestamp";
     private static final String HISTORY_LAST_TIME_USED = "last_time_used";
+    private static final String HISTORY_PENDING = "pending_delivery";
+    public static final String LAST_QUERY_ATTEMPT = "pdk-daily-last-query-attempt";
+    public static final String LAST_QUERY_SUCCESS = "pdk-daily-last-query-success";
+    public static final String LAST_QUERY_RESULT = "pdk-daily-last-query-result";
 
     private static DailyUsageAggregateGenerator sInstance;
     private static final AtomicBoolean sAggregationRunning = new AtomicBoolean(false);
@@ -130,15 +135,24 @@ public class DailyUsageAggregateGenerator extends Generator {
 
             this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
+            this.mDatabase.beginTransaction();
+            try {
             int version = this.getDatabaseVersion(this.mDatabase);
 
             switch (version) {
                 case 0:
                     this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_daily_usage_aggregate_create_history_table));
+                case 1:
+                    // Existing history is deliberately not replayed by this upgrade.
+                    this.mDatabase.execSQL("ALTER TABLE history ADD COLUMN pending_delivery INTEGER NOT NULL DEFAULT 0");
             }
 
             if (version != DailyUsageAggregateGenerator.DATABASE_VERSION) {
                 this.setDatabaseVersion(this.mDatabase, DailyUsageAggregateGenerator.DATABASE_VERSION);
+            }
+            this.mDatabase.setTransactionSuccessful();
+            } finally {
+                this.mDatabase.endTransaction();
             }
         }
     }
@@ -280,12 +294,35 @@ public class DailyUsageAggregateGenerator extends Generator {
 
         try {
             this.runAggregationLocked();
+        } catch (RuntimeException error) {
+            PreferenceManager.getDefaultSharedPreferences(this.mContext).edit()
+                    .putString(LAST_QUERY_RESULT, "error").apply();
+            throw error;
         } finally {
-            DailyUsageAggregateGenerator.sAggregationRunning.set(false);
+            try {
+                this.replayPending();
+            } finally {
+                DailyUsageAggregateGenerator.sAggregationRunning.set(false);
+            }
         }
     }
 
     private void runAggregationLocked() {
+        SharedPreferences health = PreferenceManager.getDefaultSharedPreferences(this.mContext);
+        if (!isEnabled(this.mContext)) {
+            health.edit().putString(LAST_QUERY_RESULT, "disabled").apply();
+            return;
+        }
+        health.edit().putLong(LAST_QUERY_ATTEMPT, System.currentTimeMillis()).apply();
+        if (!hasPermissions(this.mContext)) {
+            health.edit().putString(LAST_QUERY_RESULT, "permission-denied").apply();
+            return;
+        }
+        UserManager userManager = (UserManager) this.mContext.getSystemService(Context.USER_SERVICE);
+        if (Build.VERSION.SDK_INT >= 24 && userManager != null && !userManager.isUserUnlocked()) {
+            health.edit().putString(LAST_QUERY_RESULT, "locked").apply();
+            return;
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
             return;
         }
@@ -293,6 +330,7 @@ public class DailyUsageAggregateGenerator extends Generator {
         UsageStatsManager usageStatsManager = (UsageStatsManager) this.mContext.getSystemService(Service.USAGE_STATS_SERVICE);
 
         if (usageStatsManager == null) {
+            health.edit().putString(LAST_QUERY_RESULT, "unavailable").apply();
             return;
         }
 
@@ -300,6 +338,7 @@ public class DailyUsageAggregateGenerator extends Generator {
         int lookbackDays = prefs.getInt(DailyUsageAggregateGenerator.LOOKBACK_DAYS, DailyUsageAggregateGenerator.LOOKBACK_DAYS_DEFAULT);
 
         if (lookbackDays <= 0) {
+            health.edit().putString(LAST_QUERY_RESULT, "disabled").apply();
             return;
         }
 
@@ -307,6 +346,9 @@ public class DailyUsageAggregateGenerator extends Generator {
 
         long todayBucket = computeDayBucket(now, TimeZone.getDefault());
 
+        boolean failed = false;
+        boolean queried = false;
+        boolean sawUsage = false;
         for (int i = 0; i < lookbackDays; i++) {
             long dayStart = todayBucket - (long) i * DAY_MS;
             long dayEnd = dayStart + DAY_MS;
@@ -319,10 +361,16 @@ public class DailyUsageAggregateGenerator extends Generator {
                 stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, dayStart, queryEnd);
             } catch (Throwable t) {
                 Log.e("PDK", "queryUsageStats failed for day " + dayStart, t);
+                failed = true;
                 continue;
             }
 
-            if (stats == null || stats.isEmpty()) {
+            if (stats == null) {
+                failed = true;
+                continue;
+            }
+            queried = true;
+            if (stats.isEmpty()) {
                 continue;
             }
 
@@ -338,6 +386,7 @@ public class DailyUsageAggregateGenerator extends Generator {
                 if (totalMs <= 0) {
                     continue;
                 }
+                sawUsage = true;
 
                 long firstTs = us.getFirstTimeStamp();
                 long lastTs = us.getLastTimeStamp();
@@ -355,19 +404,69 @@ public class DailyUsageAggregateGenerator extends Generator {
                 values.put(DailyUsageAggregateGenerator.HISTORY_FIRST_TIMESTAMP, firstTs);
                 values.put(DailyUsageAggregateGenerator.HISTORY_LAST_TIMESTAMP, lastTs);
                 values.put(DailyUsageAggregateGenerator.HISTORY_LAST_TIME_USED, lastTimeUsed);
+                values.put(DailyUsageAggregateGenerator.HISTORY_PENDING, 1);
 
-                this.mDatabase.insertWithOnConflict(DailyUsageAggregateGenerator.TABLE_HISTORY, null, values, SQLiteDatabase.CONFLICT_REPLACE);
+                if (this.mDatabase.insertWithOnConflict(DailyUsageAggregateGenerator.TABLE_HISTORY, null,
+                        values, SQLiteDatabase.CONFLICT_REPLACE) == -1) {
+                    throw new android.database.sqlite.SQLiteException("Unable to persist daily usage summary");
+                }
+            }
+        }
+        SharedPreferences.Editor result = health.edit().putString(LAST_QUERY_RESULT,
+                failed ? "error" : (sawUsage ? "collected" : "empty"));
+        if (queried && !failed) {
+            result.putLong(LAST_QUERY_SUCCESS, System.currentTimeMillis());
+        }
+        result.apply();
+    }
 
-                Bundle update = new Bundle();
-                update.putLong(DailyUsageAggregateGenerator.HISTORY_OBSERVED, now);
-                update.putLong(DailyUsageAggregateGenerator.HISTORY_DAY_BUCKET, dayStart);
-                update.putString(DailyUsageAggregateGenerator.HISTORY_PACKAGE, packageName);
-                update.putLong(DailyUsageAggregateGenerator.HISTORY_TOTAL_MS, totalMs);
-                update.putLong(DailyUsageAggregateGenerator.HISTORY_FIRST_TIMESTAMP, firstTs);
-                update.putLong(DailyUsageAggregateGenerator.HISTORY_LAST_TIMESTAMP, lastTs);
-                update.putLong(DailyUsageAggregateGenerator.HISTORY_LAST_TIME_USED, lastTimeUsed);
+    public long pendingDeliveryCount() {
+        try (Cursor cursor = this.mDatabase.rawQuery("SELECT COUNT(*) FROM history WHERE pending_delivery = 1", null)) {
+            return cursor.moveToFirst() ? cursor.getLong(0) : 0;
+        }
+    }
 
-                Generators.getInstance(this.mContext).notifyGeneratorUpdated(DailyUsageAggregateGenerator.GENERATOR_IDENTIFIER, update);
+    public long oldestPendingTimestamp() {
+        try (Cursor cursor = this.mDatabase.rawQuery("SELECT MIN(observed) FROM history WHERE pending_delivery = 1", null)) {
+            return cursor.moveToFirst() && !cursor.isNull(0) ? cursor.getLong(0) : 0;
+        }
+    }
+
+    /** Replay only observations recorded or changed since the durable-delivery upgrade. */
+    public synchronized void replayPending() {
+        while (true) {
+            List<Bundle> updates = new ArrayList<>();
+            try (Cursor cursor = this.mDatabase.query(TABLE_HISTORY, null, HISTORY_PENDING + " = 1",
+                    null, null, null, HISTORY_OBSERVED + " ASC", "128")) {
+                while (cursor.moveToNext()) {
+                    Bundle update = new Bundle();
+                    for (String column : new String[] { HISTORY_OBSERVED, HISTORY_DAY_BUCKET,
+                            HISTORY_TOTAL_MS, HISTORY_FIRST_TIMESTAMP, HISTORY_LAST_TIMESTAMP, HISTORY_LAST_TIME_USED }) {
+                        update.putLong(column, cursor.getLong(cursor.getColumnIndexOrThrow(column)));
+                    }
+                    update.putString(HISTORY_PACKAGE, cursor.getString(cursor.getColumnIndexOrThrow(HISTORY_PACKAGE)));
+                    updates.add(update);
+                }
+            }
+            if (updates.isEmpty() || !Generators.getInstance(this.mContext)
+                    .enqueueGeneratorUpdates(GENERATOR_IDENTIFIER, updates)) {
+                return;
+            }
+            this.mDatabase.beginTransaction();
+            try {
+                ContentValues delivered = new ContentValues();
+                delivered.put(HISTORY_PENDING, 0);
+                for (Bundle update : updates) {
+                    // A newer collection may have replaced a row while the batch was persisted.
+                    this.mDatabase.update(TABLE_HISTORY, delivered,
+                            "day_bucket = ? AND package = ? AND observed = ? AND total_ms = ?",
+                            new String[] { String.valueOf(update.getLong(HISTORY_DAY_BUCKET)),
+                                    update.getString(HISTORY_PACKAGE), String.valueOf(update.getLong(HISTORY_OBSERVED)),
+                                    String.valueOf(update.getLong(HISTORY_TOTAL_MS)) });
+                }
+                this.mDatabase.setTransactionSuccessful();
+            } finally {
+                this.mDatabase.endTransaction();
             }
         }
     }
@@ -451,7 +550,7 @@ public class DailyUsageAggregateGenerator extends Generator {
 
         long cutoff = System.currentTimeMillis() - retentionPeriod;
 
-        String where = DailyUsageAggregateGenerator.HISTORY_DAY_BUCKET + " < ?";
+        String where = DailyUsageAggregateGenerator.HISTORY_DAY_BUCKET + " < ? AND " + HISTORY_PENDING + " = 0";
         String[] args = { String.valueOf(cutoff) };
 
         this.mDatabase.delete(DailyUsageAggregateGenerator.TABLE_HISTORY, where, args);

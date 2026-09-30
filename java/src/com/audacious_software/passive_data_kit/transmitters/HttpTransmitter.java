@@ -11,6 +11,7 @@ import android.os.BadParcelableException;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 import android.os.Parcel;
@@ -23,6 +24,7 @@ import com.audacious_software.passive_data_kit.PassiveDataKit;
 import com.audacious_software.passive_data_kit.Toolbox;
 import com.audacious_software.passive_data_kit.generators.Generator;
 import com.audacious_software.passive_data_kit.generators.Generators;
+import com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator;
 import com.audacious_software.passive_data_kit.R;
 import com.fasterxml.jackson.core.JsonEncoding;
 import com.fasterxml.jackson.core.JsonFactory;
@@ -43,6 +45,7 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FilenameFilter;
 import java.io.IOException;
+import java.io.FileOutputStream;
 import java.math.BigInteger;
 import java.net.UnknownHostException;
 import java.nio.charset.Charset;
@@ -60,7 +63,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.GZIPOutputStream;
 
 import javax.net.ssl.SSLContext;
@@ -79,7 +84,7 @@ import okhttp3.ResponseBody;
 import okhttp3.tls.HandshakeCertificates;
 
 @SuppressWarnings({"PointlessBooleanExpression", "unused"})
-public class HttpTransmitter extends Transmitter implements Generators.GeneratorUpdatedListener {
+public class HttpTransmitter extends Transmitter implements Generators.DurableGeneratorUpdatedListener {
     public static final String UPLOAD_URI = "com.audacious_software.passive_data_kit.transmitters.HttpTransmitter.UPLOAD_URI";
     public static final String USER_ID = "com.audacious_software.passive_data_kit.transmitters.HttpTransmitter.USER_ID";
     private static final String HASH_ALGORITHM = "com.audacious_software.passive_data_kit.transmitters.HttpTransmitter.HASH_ALGORITHM";
@@ -99,6 +104,11 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
     public static final String PRIVATE_KEY = "com.audacious_software.passive_data_kit.transmitters.HttpTransmitter.PRIVATE_KEY";
 
     private static final String LAST_SUCCESSFUL_TRANSMISSION = "com.audacious_software.passive_data_kit.transmitters.HttpTransmitter.LAST_SUCCESSFUL_TRANSMISSION";
+    private static final String LAST_TRANSMISSION_ATTEMPT = "pdk-last-upload-attempt";
+    private static final long MIN_RETRY_DELAY = 30_000L;
+    private static final long MAX_RETRY_DELAY = 30 * 60_000L;
+    private static final HashSet<String> ACTIVE_FILES = new HashSet<>();
+    private static final HashMap<String, ReentrantLock> DRAIN_LOCKS = new HashMap<>();
 
     private static final String ERROR_FILE_EXTENSION = ".error";
     private static final String JSON_EXTENSION = ".json";
@@ -138,30 +148,20 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
     private int mCurrentReadingCount = 0;
     private int mMaxReadingCount = 256;
     private int mCurrentBytesWritten = 0;
-
+    private final HandlerThread mDiskThread = new HandlerThread("PDK-upload-disk");
+    private final HandlerThread mNetworkThread = new HandlerThread("PDK-upload-network");
+    private final Handler mNetworkHandler;
+    private volatile boolean mInitialized;
+    private boolean mDrainScheduled;
+    private long mNextRetryAt;
+    private long mRetryDelay;
+    private final ArrayList<Runnable> mDrainCompletions = new ArrayList<>();
+    private final Runnable mRetryUpload = () -> this.transmit(true);
     public HttpTransmitter() {
-        super();
-
-        final HttpTransmitter me = this;
-
-        if (this.mLooperThread == null) {
-            this.mLooperThread = new Thread() {
-                public void run() {
-                    Looper.prepare();
-
-                    me.mHandler = new Handler(Looper.myLooper()) {
-                        public void handleMessage(Message message) {
-                            Log.e("PDK", "[HTTP] HANDLE MESSAGE: " + message);
-                            // process incoming messages here
-                        }
-                    };
-
-                    Looper.loop();
-                }
-            };
-        }
-
-        this.mLooperThread.start();
+        this.mDiskThread.start();
+        this.mNetworkThread.start();
+        this.mHandler = new Handler(this.mDiskThread.getLooper());
+        this.mNetworkHandler = new Handler(this.mNetworkThread.getLooper());
     }
 
     @SuppressWarnings({"StringConcatenationInLoop"})
@@ -251,11 +251,42 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
             this.mUserAgent = options.get(HttpTransmitter.USER_AGENT_NAME);
         }
 
+        this.mNextRetryAt = Math.min(System.currentTimeMillis() + MAX_RETRY_DELAY,
+                PreferenceManager.getDefaultSharedPreferences(this.mContext).getLong(this.retryPreferenceKey(), 0));
+        this.mLastAttempt = PreferenceManager.getDefaultSharedPreferences(this.mContext)
+                .getLong(LAST_TRANSMISSION_ATTEMPT, 0);
+        this.mInitialized = true;
+        synchronized (ACTIVE_FILES) {
+            this.recoverInterruptedFiles();
+        }
         Generators.getInstance(this.mContext).addNewGeneratorUpdatedListener(this);
+        this.mHandler.post(() -> {
+            try {
+                DailyUsageAggregateGenerator.getInstance(this.mContext).replayPending();
+            } catch (RuntimeException error) {
+                this.recordFailure(error);
+            }
+        });
+        if (this.mNextRetryAt > 0) {
+            // A persisted deadline alone cannot wake the new process after a restart.
+            this.scheduleRetryAt(this.mNextRetryAt);
+        }
     }
 
     public void deinitialize(Context context) {
         Generators.getInstance(this.mContext).removeGeneratorUpdatedListener(this);
+        this.mInitialized = false;
+        this.mNetworkHandler.removeCallbacks(this.mRetryUpload);
+        this.mHandler.post(() -> {
+            try {
+                this.closeOpenSession();
+            } catch (IOException error) {
+                this.recordFailure(error);
+            } finally {
+                this.mDiskThread.quitSafely();
+                this.mNetworkThread.quitSafely();
+            }
+        });
     }
 
     private boolean shouldAttemptUpload(boolean force) {
@@ -279,242 +310,159 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
     }
 
     @Override
-    public boolean transmit(boolean force) {
-        if (this.mContext == null) {
-            return false;
-        }
-
+    public synchronized boolean transmit(boolean force) {
         long now = System.currentTimeMillis();
-
-        if (force) {
-            this.mLastAttempt = 0;
-        }
-
-        if (this.mHandler == null || now - this.mLastAttempt < this.mUploadInterval || !this.shouldAttemptUpload(force)) {
+        if (!this.mInitialized || this.mDrainScheduled) {
             return false;
         }
-
-        this.mLastAttempt = now;
-
-        final HttpTransmitter me = this;
-
-        Runnable r = new Runnable() {
-            @SuppressWarnings("ResultOfMethodCallIgnored")
-            @SuppressLint("TrulyRandom")
-            public void run() {
-                synchronized (me) {
-                    try {
-                        File pendingFolder = me.getPendingFolder();
-
-                        me.closeOpenSession();
-
-                        String[] largeFiles = pendingFolder.list(new FilenameFilter() {
-                            public boolean accept(File dir, String filename) {
-                                if (filename.endsWith(HttpTransmitter.TOO_LARGE_FILE_EXTENSION)) {
-                                    return true;
-                                }
-
-                                return false;
-                            }
-                        });
-
-                        if (largeFiles == null) {
-                            largeFiles = new String[0];
-                        }
-
-                        if (largeFiles.length == 0) {
-                            largeFiles = pendingFolder.list(new FilenameFilter() {
-                                public boolean accept(File dir, String filename) {
-                                    if (filename.endsWith(HttpTransmitter.ERROR_FILE_EXTENSION)) {
-                                        return true;
-                                    }
-
-                                    return false;
-                                }
-                            });
-                        }
-
-                        if (largeFiles == null) {
-                            largeFiles = new String[0];
-                        }
-
-                        for (String filename : largeFiles) {
-                            File payloadFile = new File(pendingFolder, filename);
-
-                            ObjectMapper mapper = new ObjectMapper();
-                            mapper.registerModule(new JsonOrgModule());
-
-                            Iterator<JSONObject> iterator = mapper.readValues(new JsonFactory().createJsonParser(payloadFile), JSONObject.class);
-
-                            JSONArray newReadings = new JSONArray();
-
-                            int length = 0;
-
-                            try {
-                                while (iterator.hasNext()) {
-                                    JSONObject reading = iterator.next();
-
-                                    newReadings.put(reading);
-
-                                    length += reading.length();
-
-                                    if (newReadings.length() >= 200 || length > (512 * 1024)) {
-                                        File newFile = new File(pendingFolder, "" + System.currentTimeMillis() + HttpTransmitter.JSON_EXTENSION);
-
-                                        FileUtils.writeStringToFile(newFile, newReadings.toString(), "UTF-8");
-
-                                        newReadings = new JSONArray();
-                                        length = 0;
-                                    }
-                                }
-                            } catch (RuntimeException ex) {
-                                if (payloadFile.getAbsolutePath().endsWith(HttpTransmitter.ERROR_FILE_EXTENSION)) {
-
-                                } else {
-                                    Logger.getInstance(me.mContext).logThrowable(ex);
-
-                                    payloadFile.renameTo(new File(payloadFile.getAbsolutePath() + HttpTransmitter.ERROR_FILE_EXTENSION));
-                                }
-                            } catch (JsonParseException ex) {
-                                // Incomplete JSON in file...
-
-                                if (payloadFile.getAbsolutePath().endsWith(HttpTransmitter.ERROR_FILE_EXTENSION)) {
-
-                                } else {
-                                    Logger.getInstance(me.mContext).logThrowable(ex);
-
-                                    payloadFile.renameTo(new File(payloadFile.getAbsolutePath() + HttpTransmitter.ERROR_FILE_EXTENSION));
-                                }
-                            }
-
-                            if (newReadings.length() > 1) {
-                                File newFile = new File(pendingFolder, "" + System.currentTimeMillis() + HttpTransmitter.JSON_EXTENSION);
-
-                                FileUtils.writeStringToFile(newFile, newReadings.toString(), "UTF-8");
-                            }
-
-                            payloadFile.delete();
-                        }
-
-                        final MutableInt found = new MutableInt(0);
-
-                        String[] filenames = pendingFolder.list(new FilenameFilter() {
-                            public boolean accept(File dir, String filename) {
-                                // Only return first 256 for performance reasons...
-                                if (found.intValue() >= 256)
-                                    return false;
-
-                                if (filename.endsWith(HttpTransmitter.JSON_EXTENSION)) {
-                                    found.add(1);
-
-                                    return true;
-                                }
-
-                                return false;
-                            }
-                        });
-
-                        if (filenames == null) {
-                            filenames = new String[0];
-                        }
-
-                        if (filenames.length < 1) {
-                            return;
-                        }
-
-                        List<String> fileList = new ArrayList<>(Arrays.asList(filenames));
-
-                        Collections.shuffle(fileList);
-
-                        int pendingCount = fileList.size();
-
-                        if (pendingCount > 0) {
-                            String filename = fileList.remove(0);
-
-                            File payloadFile = new File(pendingFolder, filename);
-
-                            if (payloadFile.exists()) {
-                                try {
-                                    BufferedReader reader = new BufferedReader(new FileReader(payloadFile));
-
-                                    StringBuilder builder = new StringBuilder();
-                                    String line = null;
-
-                                    char[] buffer = new char[1024];
-
-                                    int read = 0;
-
-                                    while ((read = reader.read(buffer, 0, buffer.length)) != -1) {
-                                        for (int i = 0; i < read; i++) {
-                                            builder.append(buffer[i]);
-                                        }
-                                    }
-
-                                    reader.close();
-
-                                    String payload = builder.toString();
-
-                                    String payloadString = (new JSONArray(payload)).toString();
-
-                                    int result = me.transmitHttpPayload(payload);
-
-                                    if (result == HttpTransmitter.RESULT_SUCCESS) {
-                                        me.mTransmitted += payloadFile.length();
-
-                                        payloadFile.delete();
-
-                                        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(me.mContext);
-                                        SharedPreferences.Editor e = prefs.edit();
-                                        e.putLong(HttpTransmitter.LAST_SUCCESSFUL_TRANSMISSION, System.currentTimeMillis());
-                                        e.apply();
-                                    }
-                                } catch (JSONException e) {
-                                    // Invalid JSON, log results.
-
-                                    // Logger.getInstance(me.mContext).logThrowable(e);
-
-                                    HashMap<String, Object> details = new HashMap<>();
-                                    payloadFile.renameTo(new File(payloadFile.getAbsolutePath() + HttpTransmitter.ERROR_FILE_EXTENSION));
-
-                                    details.put("name", payloadFile.getAbsolutePath());
-                                    details.put("size", payloadFile.length());
-
-                                    Logger.getInstance(me.mContext).log("corrupted_file", details);
-                                } catch (OutOfMemoryError e) {
-                                    // File too large, rename for break-up and transmission later.
-
-                                    Logger.getInstance(me.mContext).logThrowable(e);
-
-                                    HashMap<String, Object> details = new HashMap<>();
-                                    payloadFile.renameTo(new File(payloadFile.getAbsolutePath() + HttpTransmitter.TOO_LARGE_FILE_EXTENSION));
-
-                                    details.put("name", payloadFile.getAbsolutePath());
-                                    details.put("size", payloadFile.length());
-
-                                    Logger.getInstance(me.mContext).log("too_large_file", details);
-                                }
-                            }
-
-                            if (fileList.size() > 0) {
-                                me.mHandler.post(this);
-                            }
-                        }
-                    } catch (OutOfMemoryError e) {
-                        e.printStackTrace();
-
-                        // Clean up memory and try again later...
-
-                        System.gc();
-                    } catch (IOException e) {
-                        Logger.getInstance(me.mContext).logThrowable(e);
-                    }
-                }
-            }
-        };
-
-        this.mHandler.post(r);
-
+        if (now < this.mNextRetryAt) {
+            this.scheduleRetryAt(this.mNextRetryAt);
+            return false;
+        }
+        if ((!force && now - this.mLastAttempt < this.mUploadInterval)
+                || !this.shouldAttemptUpload(force)) {
+            return false;
+        }
+        this.mDrainScheduled = true;
+        // A disk barrier includes observations already waiting on the writer thread.
+        this.mHandler.post(() -> this.mNetworkHandler.post(this::drainQueue));
         return true;
+    }
+
+    private synchronized void scheduleRetryAt(long deadline) {
+        this.mNetworkHandler.removeCallbacks(this.mRetryUpload);
+        if (this.mInitialized) {
+            this.mNetworkHandler.postDelayed(this.mRetryUpload,
+                    Math.max(0, deadline - System.currentTimeMillis()));
+        }
+    }
+
+    private void drainQueue() {
+        boolean failed = false;
+        boolean more = false;
+        ReentrantLock drainLock;
+        synchronized (DRAIN_LOCKS) {
+            String directory = this.getPendingFolder().getAbsolutePath();
+            drainLock = DRAIN_LOCKS.get(directory);
+            if (drainLock == null) {
+                drainLock = new ReentrantLock();
+                DRAIN_LOCKS.put(directory, drainLock);
+            }
+        }
+        boolean ownsDrain = drainLock.tryLock();
+        try {
+            if (!ownsDrain) {
+                more = true;
+                return;
+            }
+            this.closeOpenSession();
+            synchronized (ACTIVE_FILES) {
+                this.recoverInterruptedFiles();
+            }
+            String[] names = this.getPendingFolder().list((dir, name) -> name.endsWith(JSON_EXTENSION));
+            if (names == null) {
+                return;
+            }
+            Arrays.sort(names);
+            // Yield between batches, and stop on the first failed request.
+            int count = Math.min(names.length, 2);
+            for (int i = 0; i < count && this.mInitialized; i++) {
+                File file = new File(this.getPendingFolder(), names[i]);
+                if (!file.isFile()) {
+                    continue;
+                }
+                if (file.length() > 8 * 1024 * 1024) {
+                    quarantine(file, ERROR_FILE_EXTENSION);
+                    this.recordFailure(new IOException("Upload bundle exceeds safe read size; retained for diagnosis"));
+                    continue;
+                }
+                this.mLastAttempt = System.currentTimeMillis();
+                PreferenceManager.getDefaultSharedPreferences(this.mContext).edit()
+                        .putLong(LAST_TRANSMISSION_ATTEMPT, this.mLastAttempt).apply();
+                String payload = FileUtils.readFileToString(file, "UTF-8");
+                try {
+                    new JSONArray(payload);
+                } catch (JSONException e) {
+                    quarantine(file, ERROR_FILE_EXTENSION);
+                    this.recordFailure(e);
+                    continue;
+                }
+                if (this.transmitHttpPayload(payload) != RESULT_SUCCESS) {
+                    failed = true;
+                    break;
+                }
+                this.mTransmitted += file.length();
+                if (!file.delete()) {
+                    throw new IOException("Cannot remove acknowledged upload bundle");
+                }
+                PreferenceManager.getDefaultSharedPreferences(this.mContext).edit()
+                        .putLong(LAST_SUCCESSFUL_TRANSMISSION, System.currentTimeMillis()).apply();
+            }
+            String[] eligible = this.getPendingFolder().list((dir, name) -> name.endsWith(JSON_EXTENSION));
+            more = eligible != null && eligible.length > 0;
+        } catch (IOException | RuntimeException e) {
+            failed = true;
+            this.recordFailure(e);
+        } finally {
+            if (ownsDrain) {
+                drainLock.unlock();
+            }
+            ArrayList<Runnable> completions;
+            synchronized (this) {
+                this.mDrainScheduled = false;
+                if (failed) {
+                    this.mRetryDelay = Math.min(MAX_RETRY_DELAY, Math.max(MIN_RETRY_DELAY, this.mRetryDelay * 2));
+                    this.mNextRetryAt = System.currentTimeMillis() + this.mRetryDelay;
+                } else {
+                    this.mRetryDelay = 0;
+                    this.mNextRetryAt = 0;
+                }
+                PreferenceManager.getDefaultSharedPreferences(this.mContext).edit()
+                        .putLong(this.retryPreferenceKey(), this.mNextRetryAt).apply();
+                if (this.mInitialized && (failed || more)) {
+                    this.scheduleRetryAt(System.currentTimeMillis()
+                            + (failed ? this.mRetryDelay : (ownsDrain ? 1000L : 5000L)));
+                }
+                completions = new ArrayList<>(this.mDrainCompletions);
+                this.mDrainCompletions.clear();
+            }
+            for (Runnable completion : completions) {
+                completion.run();
+            }
+        }
+    }
+
+    public long lastTransmissionAttempt() {
+        return this.mLastAttempt;
+    }
+
+    /** Keeps a JobService alive until this bounded drain (at most two 45-second calls) finishes. */
+    public synchronized void transmitWithCompletion(boolean force, Runnable completion) {
+        if (this.mDrainScheduled) {
+            this.mDrainCompletions.add(completion);
+        } else if (this.transmit(force)) {
+            this.mDrainCompletions.add(completion);
+        } else {
+            completion.run();
+        }
+    }
+
+    private String retryPreferenceKey() {
+        return "pdk-upload-retry:" + this.mUploadUri + ":" + this.mUserId;
+    }
+
+    private void recordFailure(Exception error) {
+        Log.e("PDK", "Upload queue operation failed; data retained", error);
+        PreferenceManager.getDefaultSharedPreferences(this.mContext).edit()
+                .putString(Transmitter.FAILURE_REASON, error.getClass().getSimpleName() + ": " + error.getMessage())
+                .putLong(Transmitter.FAILURE_TIMESTAMP, System.currentTimeMillis()).apply();
+    }
+
+    private static void quarantine(File file, String suffix) throws IOException {
+        File destination = new File(file.getAbsolutePath() + suffix);
+        if (!file.renameTo(destination)) {
+            throw new IOException("Unable to preserve interrupted upload file");
+        }
     }
 
     @SuppressWarnings("ResultOfMethodCallIgnored")
@@ -532,8 +480,10 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
             HandshakeCertificates certificates = PassiveDataKit.getInstance(this.mContext).fetchTrustedCertificates();
 
             OkHttpClient client = new OkHttpClient.Builder()
-                    .connectTimeout(3, TimeUnit.MINUTES)
-                    .readTimeout(3, TimeUnit.MINUTES)
+                    .connectTimeout(15, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .writeTimeout(30, TimeUnit.SECONDS)
+                    .callTimeout(45, TimeUnit.SECONDS)
                     .sslSocketFactory(certificates.sslSocketFactory(), certificates.trustManager())
                     .build();
 
@@ -565,8 +515,10 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
                 final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
 
                 client = new OkHttpClient.Builder()
-                        .connectTimeout(3, TimeUnit.MINUTES)
-                        .readTimeout(3, TimeUnit.MINUTES)
+                        .connectTimeout(15, TimeUnit.SECONDS)
+                        .readTimeout(30, TimeUnit.SECONDS)
+                        .writeTimeout(30, TimeUnit.SECONDS)
+                        .callTimeout(45, TimeUnit.SECONDS)
                         .sslSocketFactory(sslSocketFactory, (X509TrustManager) trustAllCerts[0])
                         .build();
             }
@@ -664,15 +616,13 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
                     .post(requestBody)
                     .build();
 
-            Response response = client.newCall(request).execute();
-
-            int code = response.code();
-
-            ResponseBody body = response.body();
-
-            String bodyString = body.string();
-
-            response.body().close();
+            int code;
+            String bodyString;
+            try (Response response = client.newCall(request).execute()) {
+                code = response.code();
+                ResponseBody body = response.body();
+                bodyString = body == null ? "" : body.string();
+            }
 
             if (code >= 200 && code < 300) {
                 JSONObject responseObject = new JSONObject(bodyString);
@@ -689,12 +639,11 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
 
                     return HttpTransmitter.RESULT_SUCCESS;
                 }
-            } else {
-                SharedPreferences.Editor e = prefs.edit();
-                e.putString(Transmitter.FAILURE_REASON, this.mContext.getString(R.string.transmission_failed_server_code, code));
-                e.putLong(Transmitter.FAILURE_TIMESTAMP, System.currentTimeMillis());
-                e.apply();
             }
+            SharedPreferences.Editor e = prefs.edit();
+            e.putString(Transmitter.FAILURE_REASON, this.mContext.getString(R.string.transmission_failed_server_code, code));
+            e.putLong(Transmitter.FAILURE_TIMESTAMP, System.currentTimeMillis());
+            e.apply();
         } catch (UnknownHostException ex) {
             SharedPreferences.Editor e = prefs.edit();
             e.putString(Transmitter.FAILURE_REASON, this.mContext.getString(R.string.transmission_failed_unknown_host, this.mUploadUri.getHost()));
@@ -712,47 +661,149 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
         return HttpTransmitter.RESULT_ERROR;
     }
 
-    @SuppressWarnings("ResultOfMethodCallIgnored")
-    protected void closeOpenSession() throws IOException {
-        synchronized(this) {
-            if (this.mCurrentFile == null) {
-                return;
-            }
-
-            File tempFile = this.mCurrentFile;
-
-            if (this.mJsonGenerator == null || tempFile == null) {
-                return;
-            }
-
-            final File pendingFolder = this.getPendingFolder();
-
-            this.mJsonGenerator.writeEndArray();
-            this.mJsonGenerator.flush();
-            this.mJsonGenerator.close();
-
-            String finalFile = tempFile.getAbsolutePath().replace(HttpTransmitter.TEMP_EXTENSION, HttpTransmitter.JSON_EXTENSION);
-
-            this.mCurrentFile = null;
+    protected synchronized void closeOpenSession() throws IOException {
+        if (this.mCurrentFile == null) {
+            return;
+        }
+        File temporary = this.mCurrentFile;
+        if (this.mJsonGenerator != null) {
+            JsonGenerator writer = this.mJsonGenerator;
             this.mJsonGenerator = null;
-
-            if (tempFile.exists()) {
-                FileUtils.moveFile(tempFile, new File(finalFile));
-            }
-
-            String[] filenames = pendingFolder.list(new FilenameFilter() {
-                public boolean accept(File dir, String filename) {
-                    return filename.endsWith(HttpTransmitter.TEMP_EXTENSION);
+            try {
+                writer.writeEndArray();
+                writer.close();
+            } catch (IOException | RuntimeException error) {
+                try { writer.close(); } catch (IOException ignored) { /* Preserve original failure. */ }
+                synchronized (ACTIVE_FILES) {
+                    ACTIVE_FILES.remove(temporary.getAbsolutePath());
                 }
-            });
-
-            if (filenames == null) {
-                filenames = new String[0];
+                // Keep interrupted bytes for recovery, but let a fresh writer make progress.
+                this.mCurrentFile = null;
+                this.mCurrentReadingCount = 0;
+                this.mCurrentBytesWritten = 0;
+                throw new IOException("Unable to finalize upload JSON; interrupted file retained", error);
             }
+        }
+        if (!temporary.isFile()) {
+            synchronized (ACTIVE_FILES) {
+                ACTIVE_FILES.remove(temporary.getAbsolutePath());
+            }
+            this.mCurrentFile = null;
+            this.mCurrentReadingCount = 0;
+            this.mCurrentBytesWritten = 0;
+            throw new IOException("Owned upload file disappeared before finalization");
+        }
+        try (FileOutputStream output = new FileOutputStream(temporary, true)) {
+            output.getFD().sync();
+        }
+        File destination = new File(temporary.getAbsolutePath().replace(TEMP_EXTENSION, JSON_EXTENSION));
+        if (!temporary.renameTo(destination)) {
+            // Retain mCurrentFile so the next finalization retries the same file.
+            throw new IOException("Cannot publish upload bundle");
+        }
+        synchronized (ACTIVE_FILES) {
+            ACTIVE_FILES.remove(temporary.getAbsolutePath());
+        }
+        this.mCurrentFile = null;
+        this.mCurrentReadingCount = 0;
+        this.mCurrentBytesWritten = 0;
+    }
 
-            for (String filename : filenames) {
-                File toDelete = new File(pendingFolder, filename);
-                toDelete.delete();
+    private Bundle withMetadata(String identifier, long timestamp, Bundle data) {
+        Bundle copy = new Bundle(data);
+        Bundle metadata = data.getBundle(Generator.PDK_METADATA);
+        metadata = metadata == null ? new Bundle() : new Bundle(metadata);
+        metadata.putString(Generator.IDENTIFIER, identifier);
+        metadata.putDouble(Generator.TIMESTAMP, timestamp / 1000.0);
+        metadata.putString(Generator.GENERATOR, Generators.getInstance(this.mContext).getGeneratorFullName(identifier));
+        metadata.putString(Generator.SOURCE, this.mUserId);
+        TimeZone zone = TimeZone.getDefault();
+        metadata.putString(Generator.TIMEZONE, zone.getID());
+        metadata.putInt(Generator.TIMEZONE_OFFSET, zone.getOffset(timestamp) / 1000);
+        copy.putBundle(Generator.PDK_METADATA, metadata);
+        return copy;
+    }
+
+    @Override
+    public synchronized boolean enqueueGeneratorUpdates(String identifier, List<Bundle> updates) {
+        if (!this.mInitialized || updates.isEmpty()) {
+            return false;
+        }
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (JsonGenerator writer = new JsonFactory().createGenerator(bytes)) {
+                writer.writeStartArray();
+                for (Bundle update : updates) {
+                    writeBundle(this.mContext, writer, this.withMetadata(identifier,
+                            update.getLong("observed", System.currentTimeMillis()), update));
+                }
+                writer.writeEndArray();
+            }
+            this.publishBundle(bytes.toByteArray());
+            return true;
+        } catch (IOException | RuntimeException error) {
+            this.recordFailure(error);
+            return false;
+        }
+    }
+
+    private File publishBundle(byte[] bytes) throws IOException {
+        File temporary = new File(this.getPendingFolder(), System.currentTimeMillis() + "-" + UUID.randomUUID() + TEMP_EXTENSION);
+        synchronized (ACTIVE_FILES) {
+            ACTIVE_FILES.add(temporary.getAbsolutePath());
+        }
+        try {
+            try (FileOutputStream output = new FileOutputStream(temporary)) {
+                output.write(bytes);
+                output.getFD().sync();
+            }
+            File destination = new File(temporary.getAbsolutePath().replace(TEMP_EXTENSION, JSON_EXTENSION));
+            if (!temporary.renameTo(destination)) {
+                throw new IOException("Cannot publish durable upload bundle");
+            }
+            return destination;
+        } finally {
+            synchronized (ACTIVE_FILES) {
+                ACTIVE_FILES.remove(temporary.getAbsolutePath());
+            }
+        }
+    }
+
+    /** Salvage complete records; keep the original interrupted bytes for diagnosis. */
+    private void recoverInterruptedFiles() {
+        File[] interrupted = this.getPendingFolder().listFiles((dir, name) -> name.endsWith(TEMP_EXTENSION));
+        if (interrupted == null) {
+            return;
+        }
+        for (File file : interrupted) {
+            if (ACTIVE_FILES.contains(file.getAbsolutePath())) {
+                continue;
+            }
+            try {
+                if (file.length() > 8 * 1024 * 1024) {
+                    quarantine(file, ERROR_FILE_EXTENSION);
+                    continue;
+                }
+                JSONArray records = new JSONArray();
+                ObjectMapper mapper = new ObjectMapper();
+                try (com.fasterxml.jackson.core.JsonParser parser = new JsonFactory().createParser(file)) {
+                    if (parser.nextToken() == com.fasterxml.jackson.core.JsonToken.START_ARRAY) {
+                        while (parser.nextToken() == com.fasterxml.jackson.core.JsonToken.START_OBJECT) {
+                            com.fasterxml.jackson.databind.JsonNode node = mapper.readTree(parser);
+                            records.put(new JSONObject(node.toString()));
+                        }
+                    }
+                } catch (IOException | JSONException malformedTail) {
+                    Log.w("PDK", "Interrupted upload has an incomplete tail; retaining original", malformedTail);
+                }
+                if (records.length() > 0) {
+                    this.publishBundle(records.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    quarantine(file, ".recovered");
+                } else {
+                    quarantine(file, ERROR_FILE_EXTENSION);
+                }
+            } catch (IOException | RuntimeException error) {
+                this.recordFailure(error);
             }
         }
     }
@@ -875,97 +926,40 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
 
     @Override
     public void onGeneratorUpdated(final String identifier, final long timestamp, Bundle data) {
-        if (this.mHandler == null) {
+        if (!this.mInitialized) {
             return;
         }
-
-        final HttpTransmitter me = this;
-
-        Runnable r = new Runnable() {
-            @Override
-            public void run() {
-                final Parcel parcel = Parcel.obtain();
-                parcel.writeBundle(data);
-                parcel.setDataPosition(0);
-
-                final boolean largeBundle = (me.mCurrentBytesWritten + parcel.dataSize()) > (1024 * 256);
-
-                if (largeBundle) {
-                    Log.e("PDK", "Large data point encountered: " + parcel.dataSize() + " bytes. Saving to dedicated bundle.");
-                }
-
-                if (largeBundle || me.mCurrentReadingCount >= me.mMaxReadingCount) {
-                    try {
-                        me.closeOpenSession();
-
-                        me.mCurrentReadingCount = 0;
-                        me.mCurrentBytesWritten = 0;
-                    } catch (IOException e) {
-                        e.printStackTrace();
+        final Bundle copy = new Bundle(data);
+        this.mHandler.post(() -> {
+            synchronized (this) {
+                try {
+                    if (copy.isEmpty()) {
+                        return;
                     }
-                }
-
-                Bundle clonedData = parcel.readBundle(getClass().getClassLoader());
-
-                if (clonedData.keySet().size() > 0) {  // Only transmit non-empty bundles...
-                    long generatorTimestamp = timestamp / 1000; // Convert to seconds...
-
-                    Generators generators = Generators.getInstance(me.mContext);
-
-                    Bundle metadata = new Bundle();
-
-                    if (clonedData.containsKey(Generator.PDK_METADATA)) {
-                        metadata = clonedData.getBundle(Generator.PDK_METADATA);
+                    if (this.mCurrentReadingCount >= this.mMaxReadingCount
+                            || this.mCurrentBytesWritten >= 256 * 1024
+                            || (this.mCurrentFile != null && this.mJsonGenerator == null)) {
+                        this.closeOpenSession();
                     }
-
-                    metadata.putString(Generator.IDENTIFIER, identifier);
-                    metadata.putDouble(Generator.TIMESTAMP, generatorTimestamp);
-                    metadata.putString(Generator.GENERATOR, generators.getGeneratorFullName(identifier));
-                    metadata.putString(Generator.SOURCE, me.mUserId);
-
-                    TimeZone timeZone = TimeZone.getDefault();
-
-                    metadata.putString(Generator.TIMEZONE, timeZone.getID());
-                    metadata.putInt(Generator.TIMEZONE_OFFSET, timeZone.getOffset(timestamp) / 1000);
-
-                    clonedData.putBundle(Generator.PDK_METADATA, metadata);
-
-                    synchronized(me) {
-                        if (me.mJsonGenerator == null || me.mCurrentFile == null) {
-                            me.mCurrentFile = new File(me.getPendingFolder(), System.currentTimeMillis() + HttpTransmitter.TEMP_EXTENSION);
-
-                            try {
-                                JsonFactory factory = new JsonFactory();
-                                me.mJsonGenerator = factory.createGenerator(me.mCurrentFile, JsonEncoding.UTF8);
-                                me.mJsonGenerator.writeStartArray();
-                            } catch (IOException e) {
-                                Logger.getInstance(me.mContext).logThrowable(e);
-
-                                me.mCurrentFile = null;
-                            }
+                    if (this.mCurrentFile == null) {
+                        this.mCurrentFile = new File(this.getPendingFolder(),
+                                System.currentTimeMillis() + "-" + UUID.randomUUID() + TEMP_EXTENSION);
+                        synchronized (ACTIVE_FILES) {
+                            ACTIVE_FILES.add(this.mCurrentFile.getAbsolutePath());
                         }
-
-                        if (me.mJsonGenerator != null) {
-                            HttpTransmitter.writeBundle(me.mContext, me.mJsonGenerator, clonedData);
-
-                            me.mCurrentReadingCount += 1;
-
-                            me.mCurrentBytesWritten += parcel.dataSize();
-
-                            if (largeBundle) {
-                                me.mCurrentReadingCount = me.mMaxReadingCount;
-                            }
-                        }
+                        this.mJsonGenerator = new JsonFactory().createGenerator(this.mCurrentFile, JsonEncoding.UTF8);
+                        this.mJsonGenerator.writeStartArray();
                     }
+                    writeBundle(this.mContext, this.mJsonGenerator, this.withMetadata(identifier, timestamp, copy));
+                    // Leave complete records visible to interrupted-file recovery after process death.
+                    this.mJsonGenerator.flush();
+                    this.mCurrentReadingCount++;
+                    this.mCurrentBytesWritten = (int) this.mCurrentFile.length();
+                } catch (IOException | RuntimeException error) {
+                    this.recordFailure(error);
                 }
-
-                parcel.recycle();
-
-                System.gc();
             }
-        };
-
-        this.mHandler.post(r);
+        });
     }
 
     private static Map<String, Object> getValues(Context context, final Bundle bundle) {
@@ -1110,15 +1104,9 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
 
             generator.writeEndObject();
         } catch (Exception e) {
-            e.printStackTrace();
-
-            Logger.getInstance(context).logThrowable(e);
-
-            HashMap<String, Object> payload = new HashMap<>();
-            payload.put("bundle_string", bundle.toString());
-            payload.put("exception_type", e.getClass().getName());
-
-            Logger.getInstance(context).log("pdk_http_transmitter_write_bundle_error", payload);
+            // Avoid reporting through the generator bus that is itself failing to serialize.
+            Log.e("PDK", "Unable to serialize upload observation", e);
+            throw new IllegalStateException("Unable to serialize upload observation", e);
         }
     }
 
@@ -1190,7 +1178,7 @@ public class HttpTransmitter extends Transmitter implements Generators.Generator
             }
         };
 
-        this.mHandler.post(r);
+        this.mNetworkHandler.post(r);
     }
 
     private String generateTestPayload(boolean includeLocation) throws JSONException {

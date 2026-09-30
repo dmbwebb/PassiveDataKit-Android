@@ -40,6 +40,9 @@ import com.audacious_software.passive_data_kit.generators.Generator;
 import com.audacious_software.passive_data_kit.generators.Generators;
 import com.audacious_software.passive_data_kit.generators.communication.TextMessages;
 import com.audacious_software.passive_data_kit.transmitters.Transmitter;
+import com.audacious_software.passive_data_kit.transmitters.HttpTransmitter;
+import com.audacious_software.passive_data_kit.generators.device.UsageStatsGenerator;
+import com.audacious_software.passive_data_kit.generators.device.DailyUsageAggregateGenerator;
 import com.audacious_software.passive_data_kit.R;
 import com.github.mikephil.charting.charts.LineChart;
 import com.github.mikephil.charting.components.XAxis;
@@ -141,7 +144,8 @@ public class SystemStatus extends Generator {
         SystemStatus.getInstance(context).startGenerator();
     }
 
-    private void startGenerator() {
+    private synchronized void startGenerator() {
+        if (this.mReceiver != null) return;
         final SystemStatus me = this;
 
         final long runtimeStart = System.currentTimeMillis();
@@ -278,6 +282,12 @@ public class SystemStatus extends Generator {
                             PackageInfo pi = packages.getPackageInfo(context.getPackageName(), PackageManager.GET_PERMISSIONS);
 
                             for (int i = 0; i < pi.requestedPermissions.length; i++) {
+                                // Usage access is an AppOp, not a runtime permission flag.
+                                if (Manifest.permission.PACKAGE_USAGE_STATS.equals(pi.requestedPermissions[i])) {
+                                    if (UsageStatsGenerator.hasPermissions(context)) granted.add(pi.requestedPermissions[i]);
+                                    else missing.add(pi.requestedPermissions[i]);
+                                    continue;
+                                }
                                 if ((pi.requestedPermissionsFlags[i] & PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0) {
                                     granted.add(pi.requestedPermissions[i]);
                                 } else {
@@ -290,16 +300,34 @@ public class SystemStatus extends Generator {
 
                         update.putStringArrayList(SystemStatus.HISTORY_GRANTED_PERMISSIONS, granted);
                         update.putStringArrayList(SystemStatus.HISTORY_MISSING_PERMISSIONS, missing);
+                        update.putLong(UsageStatsGenerator.LAST_QUERY_ATTEMPT, prefs.getLong(UsageStatsGenerator.LAST_QUERY_ATTEMPT, 0));
+                        update.putLong(UsageStatsGenerator.LAST_QUERY_SUCCESS, prefs.getLong(UsageStatsGenerator.LAST_QUERY_SUCCESS, 0));
+                        update.putString(UsageStatsGenerator.LAST_QUERY_RESULT, prefs.getString(UsageStatsGenerator.LAST_QUERY_RESULT, "not_attempted"));
+                        DailyUsageAggregateGenerator daily = DailyUsageAggregateGenerator.getInstance(context);
+                        update.putLong("daily_usage_last_query_attempt", prefs.getLong(DailyUsageAggregateGenerator.LAST_QUERY_ATTEMPT, 0));
+                        update.putLong("daily_usage_last_query_success", prefs.getLong(DailyUsageAggregateGenerator.LAST_QUERY_SUCCESS, 0));
+                        update.putString("daily_usage_last_query_result", prefs.getString(DailyUsageAggregateGenerator.LAST_QUERY_RESULT, "not_attempted"));
+                        update.putLong("daily_usage_pending_rows", daily.pendingDeliveryCount());
+                        update.putLong("daily_usage_oldest_pending_timestamp", daily.oldestPendingTimestamp());
+                        long lastUploadAttempt = 0;
+                        long lastUploadAcknowledgement = 0;
+                        for (Transmitter transmitter : Generators.getInstance(context).activeTransmitters()) {
+                            lastUploadAcknowledgement = Math.max(lastUploadAcknowledgement, transmitter.lastSuccessfulTransmission());
+                            if (transmitter instanceof HttpTransmitter) {
+                                lastUploadAttempt = Math.max(lastUploadAttempt, ((HttpTransmitter) transmitter).lastTransmissionAttempt());
+                            }
+                        }
+                        update.putLong("last_upload_attempt", lastUploadAttempt);
+                        update.putLong("last_upload_acknowledgement", lastUploadAcknowledgement);
+                        update.putString("last_upload_error", prefs.getString(Transmitter.FAILURE_REASON, ""));
+                        update.putLong("last_upload_error_timestamp", prefs.getLong(Transmitter.FAILURE_TIMESTAMP, 0));
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            android.app.ActivityManager manager = (android.app.ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+                            update.putBoolean("background_restricted", manager != null && manager.isBackgroundRestricted());
+                        }
 
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                            boolean appUsagePermission = false;
-
-                            AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
-                            int mode = appOps.checkOpNoThrow("android:get_usage_stats", android.os.Process.myUid(), context.getPackageName());
-
-                            if (mode == AppOpsManager.MODE_ALLOWED) {
-                                appUsagePermission = true;
-                            }
+                            boolean appUsagePermission = UsageStatsGenerator.hasPermissions(context);
 
                             update.putBoolean(SystemStatus.HISTORY_HAS_APP_USAGE_PERMISSION, appUsagePermission);
                         }

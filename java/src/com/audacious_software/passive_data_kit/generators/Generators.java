@@ -275,6 +275,29 @@ public class Generators {
         }
     }
 
+    /** True only when at least one durable listener has accepted the complete batch. */
+    public boolean enqueueGeneratorUpdates(String identifier, List<Bundle> updates) {
+        HashSet<GeneratorUpdatedListener> listeners;
+        synchronized (this.mGeneratorUpdatedListeners) {
+            listeners = new HashSet<>(this.mGeneratorUpdatedListeners);
+        }
+        boolean accepted = false;
+        for (GeneratorUpdatedListener listener : listeners) {
+            if (listener instanceof DurableGeneratorUpdatedListener) {
+                if (!((DurableGeneratorUpdatedListener) listener).enqueueGeneratorUpdates(identifier, updates)) {
+                    return false;
+                }
+                accepted = true;
+            }
+        }
+        return accepted;
+    }
+
+    public interface DurableGeneratorUpdatedListener extends GeneratorUpdatedListener {
+        /** Acceptance means durable local storage, not receipt by the server. */
+        boolean enqueueGeneratorUpdates(String identifier, List<Bundle> updates);
+    }
+
     public void notifyGeneratorUpdated(String identifier, Bundle bundle) {
         long timestamp = System.currentTimeMillis();
 
