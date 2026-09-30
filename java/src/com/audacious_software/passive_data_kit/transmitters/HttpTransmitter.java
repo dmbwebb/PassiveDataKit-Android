@@ -33,7 +33,6 @@ import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsonorg.JsonOrgModule;
 
-import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.mutable.MutableInt;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -42,7 +41,8 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileReader;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.FileOutputStream;
@@ -379,7 +379,21 @@ public class HttpTransmitter extends Transmitter implements Generators.DurableGe
                 this.mLastAttempt = System.currentTimeMillis();
                 PreferenceManager.getDefaultSharedPreferences(this.mContext).edit()
                         .putLong(LAST_TRANSMISSION_ATTEMPT, this.mLastAttempt).apply();
-                String payload = FileUtils.readFileToString(file, "UTF-8");
+                String payload;
+                // Commons IO's file reader calls File.toPath(), unavailable on API 24/25.
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        new FileInputStream(file), java.nio.charset.StandardCharsets.UTF_8))) {
+                    StringBuilder text = new StringBuilder();
+                    char[] buffer = new char[8192];
+                    int read;
+                    while ((read = reader.read(buffer)) != -1) {
+                        text.append(buffer, 0, read);
+                        if (text.length() > 8 * 1024 * 1024) {
+                            throw new IOException("Upload bundle grew beyond safe read size");
+                        }
+                    }
+                    payload = text.toString();
+                }
                 try {
                     new JSONArray(payload);
                 } catch (JSONException e) {
