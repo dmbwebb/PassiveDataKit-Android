@@ -148,6 +148,13 @@ public class PassiveDataKit {
                 } catch (Exception e) {
                     Log.e("PDK", "Cannot start foreground service: " + e.getMessage());
                 }
+            } else {
+                try {
+                    this.mContext.startService(intent);
+                    notificationStarted = true;
+                } catch (RuntimeException error) {
+                    Log.e("PDK", "Cannot start monitoring service", error);
+                }
             }
         }
 

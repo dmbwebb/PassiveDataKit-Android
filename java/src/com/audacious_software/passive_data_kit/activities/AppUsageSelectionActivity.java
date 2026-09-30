@@ -11,6 +11,7 @@ import android.os.Bundle;
 
 
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.ActionBar;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
@@ -28,8 +29,8 @@ import android.widget.ListView;
 import android.widget.TextView;
 
 
-import com.audacious_software.passive_data_kit.R;
 import com.audacious_software.passive_data_kit.PackageManagerUtils;
+import com.audacious_software.passive_data_kit.R;
 import com.audacious_software.passive_data_kit.activities.generators.DataPointsAdapter;
 
 import java.util.ArrayList;
@@ -47,9 +48,11 @@ public class AppUsageSelectionActivity extends AppCompatActivity {
 
         this.setContentView(R.layout.layout_app_usage_selection);
 
-        if (this.getSupportActionBar() != null) {
-            this.getSupportActionBar().setTitle(R.string.title_app_usage_selection);
-            this.getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+        ActionBar actionBar = this.getSupportActionBar();
+
+        if (actionBar != null) {
+            actionBar.setTitle(R.string.title_app_usage_selection);
+            actionBar.setDisplayHomeAsUpEnabled(true);
         }
 
         final PackageManager packageManager = this.getPackageManager();
@@ -61,9 +64,9 @@ public class AppUsageSelectionActivity extends AppCompatActivity {
                 continue;
             }
 
-            Intent intent = PackageManagerUtils.safeGetLaunchIntentForPackage(packageManager, pkgInfo.packageName);
+            Intent launchIntent = PackageManagerUtils.safeGetLaunchIntentForPackage(packageManager, pkgInfo.packageName);
 
-            if (intent != null) {
+            if (launchIntent != null) {
                 apps.add(pkgInfo);
             }
         }

@@ -17,24 +17,26 @@ public final class PackageManagerUtils {
             return null;
         }
 
-        Intent infoIntent = new Intent(Intent.ACTION_MAIN);
-        infoIntent.addCategory(Intent.CATEGORY_INFO);
-        infoIntent.setPackage(packageName);
-
-        Intent launchIntent = PackageManagerUtils.resolveValidActivity(packageManager, infoIntent);
+        Intent launchIntent = PackageManagerUtils.findLaunchIntent(
+                packageManager,
+                packageName,
+                Intent.CATEGORY_INFO);
 
         if (launchIntent != null) {
             return launchIntent;
         }
 
-        Intent launcherIntent = new Intent(Intent.ACTION_MAIN);
-        launcherIntent.addCategory(Intent.CATEGORY_LAUNCHER);
-        launcherIntent.setPackage(packageName);
-
-        return PackageManagerUtils.resolveValidActivity(packageManager, launcherIntent);
+        return PackageManagerUtils.findLaunchIntent(
+                packageManager,
+                packageName,
+                Intent.CATEGORY_LAUNCHER);
     }
 
-    private static Intent resolveValidActivity(PackageManager packageManager, Intent queryIntent) {
+    private static Intent findLaunchIntent(PackageManager packageManager, String packageName, String category) {
+        Intent queryIntent = new Intent(Intent.ACTION_MAIN);
+        queryIntent.addCategory(category);
+        queryIntent.setPackage(packageName);
+
         List<ResolveInfo> matches = packageManager.queryIntentActivities(queryIntent, 0);
 
         if (matches == null) {
