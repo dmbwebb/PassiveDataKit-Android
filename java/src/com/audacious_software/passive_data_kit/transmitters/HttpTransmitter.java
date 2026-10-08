@@ -663,7 +663,7 @@ public class HttpTransmitter extends Transmitter implements Generators.DurableGe
             e.putString(Transmitter.FAILURE_REASON, this.mContext.getString(R.string.transmission_failed_unknown_host, this.mUploadUri.getHost()));
             e.putLong(Transmitter.FAILURE_TIMESTAMP, System.currentTimeMillis());
             e.apply();
-        } catch (Exception ex) {
+        } catch (Exception | LinkageError ex) {
             ex.printStackTrace();
 
             SharedPreferences.Editor e = prefs.edit();

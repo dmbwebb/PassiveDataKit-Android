@@ -13,7 +13,11 @@ import java.util.Locale;
 import java.util.regex.Pattern;
 
 public class Toolbox {
-    private static final LazySodiumAndroid SODIUM = new LazySodiumAndroid(new SodiumAndroid());
+    // Base64 and slug helpers must not load JNI. A native-library failure should
+    // affect only the operation that requires cryptography, not ordinary uploads.
+    private static final class SodiumHolder {
+        private static final LazySodiumAndroid INSTANCE = new LazySodiumAndroid(new SodiumAndroid());
+    }
 
     private static final Pattern NONLATIN = Pattern.compile("[^\\w-]");
     private static final Pattern WHITESPACE = Pattern.compile("[\\s]");
@@ -42,7 +46,7 @@ public class Toolbox {
 
         byte[] ciphertext = new byte[Box.MACBYTES + message.length];
 
-        if (Toolbox.SODIUM.cryptoBoxEasy(ciphertext, message, message.length, nonce, publicKey, privateKey)) {
+        if (SodiumHolder.INSTANCE.cryptoBoxEasy(ciphertext, message, message.length, nonce, publicKey, privateKey)) {
             return Toolbox.encodeBase64(ciphertext);
         }
 
@@ -52,12 +56,12 @@ public class Toolbox {
     public static String hash(String payload) {
         byte[] message = payload.getBytes(Charset.forName("UTF-8"));
         byte[] hashText = new byte[Hash.SHA512_BYTES];
-        Toolbox.SODIUM.cryptoHashSha512(hashText, message, message.length);
+        SodiumHolder.INSTANCE.cryptoHashSha512(hashText, message, message.length);
 
         return Toolbox.encodeBase64(hashText);
     }
 
     public static byte[] randomNonce() {
-        return Toolbox.SODIUM.randomBytesBuf(Box.NONCEBYTES);
+        return SodiumHolder.INSTANCE.randomBytesBuf(Box.NONCEBYTES);
     }
 }
