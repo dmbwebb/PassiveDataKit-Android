@@ -197,6 +197,71 @@ public abstract class Generator {
         }
     }
 
+    @FunctionalInterface
+    protected interface DatabaseMigration {
+        void migrate(SQLiteDatabase db, int oldVersion);
+    }
+
+    /** Opt-in atomic setup for generators that can recover an interrupted schema. */
+    protected void initializeDatabase(SQLiteDatabase db, int targetVersion, DatabaseMigration migration) {
+        try {
+            db.beginTransaction();
+            try {
+                int version = this.getDatabaseVersion(db);
+                if (version < targetVersion) {
+                    migration.migrate(db, version);
+                    this.setDatabaseVersion(db, targetVersion);
+                    // SQLiteDatabase.insert can fail by returning -1 without throwing.
+                    if (this.getDatabaseVersion(db) != targetVersion) {
+                        throw new SQLiteException("Generator schema version was not saved");
+                    }
+                }
+                db.setTransactionSuccessful();
+            } finally {
+                db.endTransaction();
+            }
+        } catch (RuntimeException | Error failure) {
+            db.close();
+            throw failure;
+        }
+    }
+
+    protected static boolean tableExists(SQLiteDatabase db, String table) {
+        try (Cursor rows = db.rawQuery("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                new String[]{table})) {
+            return rows.moveToFirst();
+        }
+    }
+
+    protected static String columnType(SQLiteDatabase db, String table, String column) {
+        try (Cursor rows = db.rawQuery("PRAGMA table_info(" + quoteIdentifier(table) + ")", null)) {
+            while (rows.moveToNext()) {
+                if (column.equals(rows.getString(rows.getColumnIndexOrThrow("name")))) {
+                    return rows.getString(rows.getColumnIndexOrThrow("type"));
+                }
+            }
+            return null;
+        }
+    }
+
+    protected static boolean columnExists(SQLiteDatabase db, String table, String column) {
+        return columnType(db, table, column) != null;
+    }
+
+    /** Keep incompatible legacy rows while allowing the intended active-schema reset. */
+    protected static String preserveLegacyTable(SQLiteDatabase db, String table, String legacyBaseName) {
+        String name = legacyBaseName;
+        for (int suffix = 1; tableExists(db, name); suffix++) {
+            name = legacyBaseName + "_" + suffix;
+        }
+        db.execSQL("ALTER TABLE " + quoteIdentifier(table) + " RENAME TO " + quoteIdentifier(name));
+        return name;
+    }
+
+    private static String quoteIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
     @SuppressWarnings("unused")
     protected abstract void flushCachedData();
 

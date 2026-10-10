@@ -120,18 +120,17 @@ public class NotificationEvents extends Generator {
 
         this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
-        int version = this.getDatabaseVersion(this.mDatabase);
-
-        switch (version) {
-            case 0:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_notification_events_create_history_table));
-        }
-
-        if (version != NotificationEvents.DATABASE_VERSION) {
-            this.setDatabaseVersion(this.mDatabase, NotificationEvents.DATABASE_VERSION);
-        }
+        this.initializeDatabase();
 
         this.flushCachedData();
+    }
+
+    private void initializeDatabase() {
+        this.initializeDatabase(this.mDatabase, DATABASE_VERSION, (db, version) -> {
+            if (!tableExists(db, TABLE_HISTORY)) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_notification_events_create_history_table));
+            }
+        });
     }
 
     @SuppressWarnings("unused")

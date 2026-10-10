@@ -172,8 +172,6 @@ public class ScreenState extends Generator{
         IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
         filter.addAction(Intent.ACTION_SCREEN_ON);
 
-        this.mContext.registerReceiver(this.mReceiver, filter);
-
         Generators.getInstance(this.mContext).registerCustomViewClass(ScreenState.GENERATOR_IDENTIFIER, ScreenState.class);
 
         File path = PassiveDataKit.getGeneratorsStorage(this.mContext);
@@ -182,21 +180,33 @@ public class ScreenState extends Generator{
 
         this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
-        int version = this.getDatabaseVersion(this.mDatabase);
-
-        switch (version) {
-            case 0:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_screen_state_create_history_table));
-            case 1:
-                this.mDatabase.execSQL("DROP TABLE history");
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_screen_state_create_history_table));
+        try {
+            this.initializeDatabase();
+        } catch (RuntimeException | Error failure) {
+            this.mReceiver = null;
+            throw failure;
         }
 
-        if (version != ScreenState.DATABASE_VERSION) {
-            this.setDatabaseVersion(this.mDatabase, ScreenState.DATABASE_VERSION);
-        }
-
+        this.mContext.registerReceiver(this.mReceiver, filter);
         this.flushCachedData();
+    }
+
+    private void initializeDatabase() {
+        this.initializeDatabase(this.mDatabase, DATABASE_VERSION, (db, version) -> {
+            if (tableExists(db, TABLE_HISTORY)) {
+                boolean current = "TEXT".equalsIgnoreCase(columnType(db, TABLE_HISTORY, "state"));
+                for (String column : new String[]{"_id", "fetched", "transmitted", "observed"}) {
+                    current &= columnExists(db, TABLE_HISTORY, column);
+                }
+                if (!current) {
+                    // Preserve unknown legacy rows instead of repeating the old DROP.
+                    preserveLegacyTable(db, TABLE_HISTORY, "history_legacy_v" + version);
+                }
+            }
+            if (!tableExists(db, TABLE_HISTORY)) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_screen_state_create_history_table));
+            }
+        });
     }
 
     @SuppressWarnings("unused")

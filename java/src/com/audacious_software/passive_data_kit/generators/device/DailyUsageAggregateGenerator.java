@@ -135,26 +135,20 @@ public class DailyUsageAggregateGenerator extends Generator {
 
             this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
-            this.mDatabase.beginTransaction();
-            try {
-            int version = this.getDatabaseVersion(this.mDatabase);
-
-            switch (version) {
-                case 0:
-                    this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_daily_usage_aggregate_create_history_table));
-                case 1:
-                    // Existing history is deliberately not replayed by this upgrade.
-                    this.mDatabase.execSQL("ALTER TABLE history ADD COLUMN pending_delivery INTEGER NOT NULL DEFAULT 0");
-            }
-
-            if (version != DailyUsageAggregateGenerator.DATABASE_VERSION) {
-                this.setDatabaseVersion(this.mDatabase, DailyUsageAggregateGenerator.DATABASE_VERSION);
-            }
-            this.mDatabase.setTransactionSuccessful();
-            } finally {
-                this.mDatabase.endTransaction();
-            }
+            this.initializeDatabase();
         }
+    }
+
+    private void initializeDatabase() {
+        this.initializeDatabase(this.mDatabase, DATABASE_VERSION, (db, version) -> {
+            if (!tableExists(db, TABLE_HISTORY)) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_daily_usage_aggregate_create_history_table));
+            }
+            if (!columnExists(db, TABLE_HISTORY, "pending_delivery")) {
+                // Existing history is deliberately not replayed by this upgrade.
+                db.execSQL("ALTER TABLE history ADD COLUMN pending_delivery INTEGER NOT NULL DEFAULT 0");
+            }
+        });
     }
 
     public static void start(final Context context) {

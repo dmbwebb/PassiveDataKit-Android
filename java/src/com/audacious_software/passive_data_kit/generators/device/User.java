@@ -74,18 +74,7 @@ public class User extends Generator {
 
         this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
-        int version = this.getDatabaseVersion(this.mDatabase);
-
-        switch (version) {
-            case 0:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_users_create_history_table));
-            case 1:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_users_history_table_add_identifier));
-        }
-
-        if (version != User.DATABASE_VERSION) {
-            this.setDatabaseVersion(this.mDatabase, User.DATABASE_VERSION);
-        }
+        this.initializeDatabase();
 
         this.flushCachedData();
 
@@ -131,6 +120,17 @@ public class User extends Generator {
         this.mReceiver.onReceive(this.mContext, new Intent(Intent.ACTION_USER_FOREGROUND));
 
         Generators.getInstance(this.mContext).registerCustomViewClass(User.GENERATOR_IDENTIFIER, User.class);
+    }
+
+    private void initializeDatabase() {
+        this.initializeDatabase(this.mDatabase, DATABASE_VERSION, (db, version) -> {
+            if (!tableExists(db, TABLE_HISTORY)) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_users_create_history_table));
+            }
+            if (!columnExists(db, TABLE_HISTORY, "identifier")) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_users_history_table_add_identifier));
+            }
+        });
     }
 
     @SuppressWarnings("unused")

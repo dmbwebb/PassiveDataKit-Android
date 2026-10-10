@@ -364,21 +364,25 @@ public class Battery extends Generator {
 
         this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
-        int version = this.getDatabaseVersion(this.mDatabase);
-
-        switch (version) {
-            case 0:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_device_battery_create_history_table));
-        }
-
-        if (version != Battery.DATABASE_VERSION) {
-            this.setDatabaseVersion(this.mDatabase, Battery.DATABASE_VERSION);
+        try {
+            this.initializeDatabase();
+        } catch (RuntimeException | Error failure) {
+            this.mReceiver = null;
+            throw failure;
         }
 
         IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
         this.mContext.registerReceiver(this.mReceiver, filter);
 
         this.flushCachedData();
+    }
+
+    private void initializeDatabase() {
+        this.initializeDatabase(this.mDatabase, DATABASE_VERSION, (db, version) -> {
+            if (!tableExists(db, TABLE_HISTORY)) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_device_battery_create_history_table));
+            }
+        });
     }
 
     @SuppressWarnings("unused")

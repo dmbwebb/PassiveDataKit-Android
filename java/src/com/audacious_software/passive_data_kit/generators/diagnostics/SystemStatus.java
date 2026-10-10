@@ -156,23 +156,7 @@ public class SystemStatus extends Generator {
 
         this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
-        int version = this.getDatabaseVersion(this.mDatabase);
-
-        switch (version) {
-            case 0:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_create_history_table));
-            case 1:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_system_runtime));
-            case 2:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_gps_enabled));
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_network_enabled));
-            case 3:
-                this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_pending_transmissions));
-        }
-
-        if (version != SystemStatus.DATABASE_VERSION) {
-            this.setDatabaseVersion(this.mDatabase, SystemStatus.DATABASE_VERSION);
-        }
+        this.initializeDatabase();
 
         this.mReceiver = new BroadcastReceiver() {
             @Override
@@ -402,6 +386,26 @@ public class SystemStatus extends Generator {
         SharedPreferences.Editor e = prefs.edit();
         e.putBoolean(SystemStatus.INSTALLED_APPS_ENABLED, enabled);
         e.apply();
+    }
+
+    private void initializeDatabase() {
+        this.initializeDatabase(this.mDatabase, DATABASE_VERSION, (db, version) -> {
+            if (!tableExists(db, TABLE_HISTORY)) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_create_history_table));
+            }
+            if (!columnExists(db, TABLE_HISTORY, "system_runtime")) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_system_runtime));
+            }
+            if (!columnExists(db, TABLE_HISTORY, "gps_enabled")) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_gps_enabled));
+            }
+            if (!columnExists(db, TABLE_HISTORY, "network_enabled")) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_network_enabled));
+            }
+            if (!columnExists(db, TABLE_HISTORY, "pending_transmissions")) {
+                db.execSQL(this.mContext.getString(R.string.pdk_generator_diagnostics_system_status_history_table_add_pending_transmissions));
+            }
+        });
     }
 
     @SuppressWarnings("unused")
