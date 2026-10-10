@@ -12,6 +12,7 @@ import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteException;
 import android.os.Build;
 import android.os.Bundle;
 import android.preference.PreferenceManager;
@@ -112,16 +113,39 @@ public class UsageStatsGenerator extends Generator {
 
             this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
+            try {
+                this.initializeDatabase();
+            } catch (RuntimeException | Error failure) {
+                this.mDatabase.close();
+                throw failure;
+            }
+        }
+    }
+
+    private void initializeDatabase() {
+        // A prior process can have committed history before writing its version.
+        // Preserve that table and commit any remaining initialization atomically.
+        this.mDatabase.beginTransaction();
+        try {
             int version = this.getDatabaseVersion(this.mDatabase);
-
-            switch (version) {
-                case 0:
+            if (version < UsageStatsGenerator.DATABASE_VERSION) {
+                boolean hasHistory;
+                try (Cursor tables = this.mDatabase.rawQuery(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        new String[]{TABLE_HISTORY})) {
+                    hasHistory = tables.moveToFirst();
+                }
+                if (!hasHistory) {
                     this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_usage_stats_create_history_table));
-            }
-
-            if (version != UsageStatsGenerator.DATABASE_VERSION) {
+                }
                 this.setDatabaseVersion(this.mDatabase, UsageStatsGenerator.DATABASE_VERSION);
+                if (this.getDatabaseVersion(this.mDatabase) != UsageStatsGenerator.DATABASE_VERSION) {
+                    throw new SQLiteException("Usage stats schema version was not saved");
+                }
             }
+            this.mDatabase.setTransactionSuccessful();
+        } finally {
+            this.mDatabase.endTransaction();
         }
     }
 
