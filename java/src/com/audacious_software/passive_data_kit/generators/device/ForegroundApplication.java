@@ -15,6 +15,7 @@ import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteException;
 import android.graphics.drawable.Drawable;
 import android.os.Build;
 import android.os.Bundle;
@@ -162,28 +163,68 @@ public class ForegroundApplication extends Generator {
 
             this.mDatabase = SQLiteDatabase.openOrCreateDatabase(path, null);
 
+            try {
+                this.initializeDatabase();
+            } catch (RuntimeException | Error failure) {
+                this.mDatabase.close();
+                this.mDatabase = null;
+                throw failure;
+            }
+        }
+    }
+
+    private void initializeDatabase() {
+        // The old migration could commit some DDL without its final version
+        // marker. Reconcile that partial schema while retaining every row.
+        this.mDatabase.beginTransaction();
+        try {
             int version = this.getDatabaseVersion(this.mDatabase);
-
-            switch (version) {
-                case 0:
+            if (version < ForegroundApplication.DATABASE_VERSION) {
+                if (!this.hasTable(TABLE_HISTORY)) {
                     this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_create_history_table));
-                case 1:
-                    this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_history_table_add_duration));
-                case 2:
-                    this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_history_table_add_screen_active));
-                case 3:
-                    this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_history_table_add_display_state));
-                case 4:
-                    this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_history_table_add_is_home));
-                case 5:
+                }
+                Set<String> columns = new HashSet<>();
+                try (Cursor cursor = this.mDatabase.rawQuery("PRAGMA table_info(history)", null)) {
+                    while (cursor.moveToNext()) {
+                        columns.add(cursor.getString(cursor.getColumnIndexOrThrow("name")));
+                    }
+                }
+                this.addMissingHistoryColumn(columns, HISTORY_DURATION,
+                        R.string.pdk_generator_foreground_applications_history_table_add_duration);
+                this.addMissingHistoryColumn(columns, HISTORY_SCREEN_ACTIVE,
+                        R.string.pdk_generator_foreground_applications_history_table_add_screen_active);
+                this.addMissingHistoryColumn(columns, HISTORY_DISPLAY_STATE,
+                        R.string.pdk_generator_foreground_applications_history_table_add_display_state);
+                this.addMissingHistoryColumn(columns, HISTORY_IS_HOME,
+                        R.string.pdk_generator_foreground_applications_history_table_add_is_home);
+                if (!this.hasTable("substitutes")) {
                     this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_create_substitutes_table));
-                case 6:
-                    this.mDatabase.execSQL(this.mContext.getString(R.string.pdk_generator_foreground_applications_history_table_add_category));
-            }
-
-            if (version != ForegroundApplication.DATABASE_VERSION) {
+                }
+                this.addMissingHistoryColumn(columns, HISTORY_CATEGORY,
+                        R.string.pdk_generator_foreground_applications_history_table_add_category);
                 this.setDatabaseVersion(this.mDatabase, ForegroundApplication.DATABASE_VERSION);
+                // Generator's insert can return -1 rather than throw. Never
+                // commit a schema whose version marker was not persisted.
+                if (this.getDatabaseVersion(this.mDatabase) != ForegroundApplication.DATABASE_VERSION) {
+                    throw new SQLiteException("Foreground application schema version was not saved");
+                }
             }
+            this.mDatabase.setTransactionSuccessful();
+        } finally {
+            this.mDatabase.endTransaction();
+        }
+    }
+
+    private boolean hasTable(String name) {
+        try (Cursor cursor = this.mDatabase.rawQuery(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", new String[]{name})) {
+            return cursor.moveToFirst();
+        }
+    }
+
+    private void addMissingHistoryColumn(Set<String> columns, String name, int migration) {
+        if (!columns.contains(name)) {
+            this.mDatabase.execSQL(this.mContext.getString(migration));
         }
     }
 
